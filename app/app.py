@@ -342,6 +342,11 @@ def _guard():
     # publicas e ser avaliada antes desta checagem. Devolve 404, e nao 403,
     # para nao confirmar que a rota existe naquela porta.
     if not MODO_ADMIN:
+        # Excecao para a RAIZ: quem digita so o endereco e a porta cai em "/",
+        # que e rota administrativa e daria 404 -- parecendo que o portal nao
+        # subiu. Encaminha para o portal em vez de punir o caminho obvio.
+        if MODO_PORTAL and request.path == "/":
+            return redirect(url_for("portal.meus"))
         abort(404)
     if ep in PUBLIC_ENDPOINTS:
         return
