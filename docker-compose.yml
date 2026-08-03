@@ -109,6 +109,11 @@ services:
     image: gestaomac-app:latest
     restart: unless-stopped
     command: ["python", "/app/collect.py"]
+    # A imagem e a mesma do web, cujo HEALTHCHECK consulta /healthz na porta
+    # 5000. O collector nao sobe servidor HTTP nenhum, entao esse teste falharia
+    # sempre e o container apareceria como "unhealthy" mesmo coletando bem.
+    healthcheck:
+      disable: true
     environment:
       <<: *app_env
       COLLECT_INTERVAL: ${COLLECT_INTERVAL:-600}

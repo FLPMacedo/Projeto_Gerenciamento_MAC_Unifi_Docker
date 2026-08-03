@@ -13,7 +13,20 @@ import logging
 import os
 import sys
 
-sys.path.insert(0, "/app")
+
+def _achar_pacote() -> None:
+    """Mesmo motivo do migrate_sqlite_to_pg.py: o layout do repositorio
+    (`<raiz>/app/unifi`) e o do container (`/app/unifi`) sao diferentes."""
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    raiz = os.path.dirname(aqui)
+    for cand in (os.path.join(raiz, "app"), raiz, "/app"):
+        if os.path.isdir(os.path.join(cand, "unifi")):
+            sys.path.insert(0, cand)
+            return
+    sys.exit("nao encontrei o pacote `unifi` a partir de " + aqui)
+
+
+_achar_pacote()
 
 from unifi import db  # noqa: E402
 

@@ -30,8 +30,24 @@ import sqlite3
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "app"))
+def _achar_pacote() -> None:
+    """Poe o pacote `unifi` no sys.path.
+
+    Sao dois layouts diferentes: no repositorio o script fica em
+    `<raiz>/scripts/` e o pacote em `<raiz>/app/unifi/`; dentro do container o
+    script vai para `/app/scripts/` e o pacote fica em `/app/unifi/`. Em vez de
+    supor um deles, procura onde `unifi/` de fato esta.
+    """
+    aqui = os.path.dirname(os.path.abspath(__file__))
+    raiz = os.path.dirname(aqui)
+    for cand in (os.path.join(raiz, "app"), raiz, "/app"):
+        if os.path.isdir(os.path.join(cand, "unifi")):
+            sys.path.insert(0, cand)
+            return
+    sys.exit("nao encontrei o pacote `unifi` a partir de " + aqui)
+
+
+_achar_pacote()
 
 # `unifi.db` puxa psycopg, que so existe dentro do container. O import fica
 # dentro de main(), depois do --dry-run, para que a conferencia da origem possa
@@ -138,14 +154,19 @@ def _linhas(sq: sqlite3.Connection, tabela: str, incluir_segredos: bool = False)
 
 
 def migrar_tabela(sq, conn, tabela: str, incluir_segredos: bool = False) -> int:
+    """Carga via COPY.
+
+    Nao leva OVERRIDING SYSTEM VALUE: essa clausula so existe no INSERT, e o
+    COPY a rejeita com erro de sintaxe. Felizmente ela nao e necessaria aqui --
+    o COPY aceita valor explicito em coluna GENERATED ALWAYS AS IDENTITY, que e
+    justamente o que precisamos para preservar os ids de collections e events.
+    A sequencia e reposicionada depois, em reposicionar_sequencias().
+    """
     cols = COLUNAS[tabela]
     lista = ", ".join(f'"{c}"' for c in cols)
-    override = " OVERRIDING SYSTEM VALUE" if tabela in IDENTITY else ""
     total = 0
     with conn.cursor() as cur:
-        with cur.copy(
-            f'COPY {tabela} ({lista}){override} FROM STDIN'
-        ) as copy:
+        with cur.copy(f'COPY {tabela} ({lista}) FROM STDIN') as copy:
             for linha in _linhas(sq, tabela, incluir_segredos):
                 copy.write_row(linha)
                 total += 1
