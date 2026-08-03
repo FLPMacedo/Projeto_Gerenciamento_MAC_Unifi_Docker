@@ -1,57 +1,78 @@
-"""Credenciais do UniFi guardadas LOCALMENTE por maquina (cada usuario usa a
-PROPRIA conta UniFi). Ficam num arquivo `creds.enc` ao lado do exe, criptografado
-com a `secret.key` LOCAL (gerada na 1a vez em cada maquina, nunca distribuida).
+"""Credenciais do UniFi no servidor: CONTA DE SERVICO unica.
 
-Nada de credencial vai para o banco compartilhado. Na 1a vez, se houver um .env
-com credenciais, elas sao usadas como semente (util em dev).
+Por que mudou em relacao ao desktop
+-----------------------------------
+Na versao desktop cada usuario usava a PROPRIA conta UniFi, e a senha dele era
+gravada cifrada num `creds.enc` LOCAL de cada maquina. Esse desenho nao
+sobrevive ao Docker: com N pessoas atendidas pelo MESMO container existe um
+unico `creds.enc`, e o ultimo que fizesse login sobrescreveria a credencial de
+todos -- a coleta agendada passaria a rodar com a conta de quem entrou por
+ultimo, sem ninguem perceber.
+
+Como funciona agora
+-------------------
+- Uma conta de servico dedicada (somente leitura no controller + permissao de
+  editar a allow-list) faz TODA a comunicacao com a UniFi: coleta e as acoes de
+  add/remover/troca.
+- O login da tela continua sendo validado contra o controller com a conta
+  PESSOAL de cada um (ver `login()` em app.py), garantindo que so quem tem
+  acesso no UniFi entra. A senha do usuario NAO e persistida em lugar nenhum.
+- A autoria das acoes continua rastreada por pessoa: os eventos gravados em
+  `events` registram `session["user"]` como autor.
+
+A credencial vem de variavel de ambiente ou de Docker secret. Nunca da imagem.
 """
 from __future__ import annotations
 
-import json
 import os
 
-from . import secret
 
-
-def _truthy(v: str) -> bool:
+def _truthy(v: str | None) -> bool:
     return (v or "").strip().lower() in {"1", "true", "yes", "on", "sim"}
 
 
-def save(creds_file: str, key_path: str, cfg: dict) -> None:
-    """Grava as credenciais (criptografadas) localmente."""
-    blob = json.dumps({
-        "host": cfg.get("host", ""), "site": cfg.get("site", "default"),
-        "username": cfg.get("username", ""), "password": cfg.get("password", ""),
-        "verify": bool(cfg.get("verify")),
-    }, ensure_ascii=False)
-    with open(creds_file, "w", encoding="utf-8") as fh:
-        fh.write(secret.encrypt(key_path, blob))
+def _env(name: str, default: str = "") -> str:
+    """Le uma variavel aceitando tambem o padrao Docker secret `<NOME>_FILE`.
+
+    O Portainer/Compose monta segredos como arquivo em /run/secrets/<nome>;
+    apontar UNIFI_SERVICE_PASSWORD_FILE para la evita a senha aparecer em
+    `docker inspect` ou na listagem de variaveis do stack.
+    """
+    path = os.getenv(f"{name}_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            pass
+    return os.getenv(name, default)
 
 
-def resolve(creds_file: str, key_path: str) -> dict | None:
-    # 1) arquivo local de credenciais (por maquina)
-    if os.path.exists(creds_file):
-        try:
-            with open(creds_file, encoding="utf-8") as fh:
-                data = json.loads(secret.decrypt(key_path, fh.read()) or "{}")
-            if data.get("host"):
-                data.setdefault("site", "default")
-                data["verify"] = bool(data.get("verify"))
-                return data
-        except Exception:
-            pass
-    # 2) semente via .env (dev / primeiro arranque)
-    if os.getenv("UNIFI_HOST"):
-        cfg = {
-            "host": os.environ["UNIFI_HOST"],
-            "site": os.getenv("UNIFI_SITE", "default"),
-            "username": os.getenv("UNIFI_USERNAME", ""),
-            "password": os.getenv("UNIFI_PASSWORD", ""),
-            "verify": _truthy(os.getenv("UNIFI_VERIFY_SSL", "")),
-        }
-        try:
-            save(creds_file, key_path, cfg)
-        except Exception:
-            pass
-        return cfg
-    return None
+def resolve() -> dict | None:
+    """Credenciais da conta de servico, ou None se nao estiver configurada."""
+    host = _env("UNIFI_HOST").strip()
+    if not host:
+        return None
+    return {
+        "host": host.rstrip("/"),
+        "site": _env("UNIFI_SITE", "default").strip() or "default",
+        "username": _env("UNIFI_SERVICE_USERNAME").strip(),
+        "password": _env("UNIFI_SERVICE_PASSWORD"),
+        "verify": _truthy(_env("UNIFI_VERIFY_SSL")),
+    }
+
+
+def is_configured() -> bool:
+    c = resolve()
+    return bool(c and c["host"] and c["username"] and c["password"])
+
+
+def describe() -> str:
+    """Resumo sem segredo, para a tela de configuracao e para os logs."""
+    c = resolve()
+    if not c:
+        return "nao configurado (defina UNIFI_HOST)"
+    who = c["username"] or "?"
+    pw = "definida" if c["password"] else "AUSENTE"
+    return (f"host={c['host']} site={c['site']} conta_servico={who} "
+            f"senha={pw} verify_ssl={c['verify']}")

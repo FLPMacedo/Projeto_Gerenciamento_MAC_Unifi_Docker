@@ -1,32 +1,48 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Configuração do acesso ao UniFi</h1>
-<p class="muted">As credenciais ficam <b>no banco local</b> (a senha é
-<b>criptografada</b>), nunca no código. Use uma conta <b>local</b> do controller.</p>
+<h1>Acesso ao UniFi</h1>
 
-<form method="post" class="cadform">
-  <label>Endereço do controller (host)
-    <input name="host" value="{{ cfg.host or '' }}" placeholder="https://IP-DO-CONTROLLER" required>
-  </label>
-  <label>Site padrão (id interno)
-    <input name="site" value="{{ cfg.site or 'default' }}" placeholder="default">
-  </label>
-  <label>Usuário UniFi
-    <input name="username" value="{{ cfg.username or '' }}" required>
-  </label>
-  <label>Senha UniFi
-    <input name="password" type="password"
-           placeholder="{{ '•••••• (deixe em branco para manter)' if has_pw else 'digite a senha' }}">
-  </label>
-  <label class="inline">
-    <input type="checkbox" name="verify" {{ 'checked' if cfg.verify }}>
-    Verificar certificado TLS (deixe desligado para o certificado autoassinado do Cloud Key)
-  </label>
-  <button class="btn primary" type="submit">Salvar e testar conexão</button>
-</form>
+<p class="muted">
+  Esta tela é <b>somente leitura</b>. Na versão desktop ela gravava host, usuário
+  e senha; num servidor compartilhado isso deixaria qualquer pessoa logada trocar
+  a conta usada por todo mundo. A configuração agora vem do <b>stack</b>
+  (variáveis de ambiente / secrets do Portainer) e só a TI altera.
+</p>
 
-{% if has_pw %}
-<p class="muted">Senha já configurada (criptografada). Digite uma nova só se quiser trocá-la.
-Depois disso você pode remover a senha do arquivo <code>.env</code>.</p>
-{% endif %}
+<div class="flash {{ 'ok' if status == 'ok' else 'err' }}">
+  {% if status == 'ok' %}Conectado ao controller. {{ detail }}
+  {% else %}Não foi possível conectar: {{ detail }}{% endif %}
+</div>
+
+<table class="tbl" style="max-width:720px">
+  <tr><th style="width:220px">Controller (host)</th>
+      <td>{{ cfg.host or '—' }}</td></tr>
+  <tr><th>Site padrão</th>
+      <td>{{ cfg.site or 'default' }}</td></tr>
+  <tr><th>Conta de serviço</th>
+      <td>{{ cfg.username or '—' }}</td></tr>
+  <tr><th>Senha da conta</th>
+      <td>{{ 'configurada' if has_pw else 'AUSENTE — a coleta não vai funcionar' }}</td></tr>
+  <tr><th>Verificar certificado TLS</th>
+      <td>{{ 'sim' if cfg.verify else 'não (certificado autoassinado do Cloud Key)' }}</td></tr>
+</table>
+
+<h2 style="margin-top:24px">Como as credenciais funcionam</h2>
+<ul class="muted">
+  <li>A <b>conta de serviço</b> acima é quem fala com a UniFi: faz a coleta e
+      executa add/remover/troca.</li>
+  <li>O <b>seu login</b> é validado na hora contra o controller com a sua conta
+      pessoal. A sua senha não é gravada em lugar nenhum.</li>
+  <li>Toda ação de escrita continua registrada na
+      <a href="{{ url_for('auditoria') }}">auditoria</a> com o nome de quem pediu.</li>
+</ul>
+
+<h2 style="margin-top:24px">Para alterar</h2>
+<p class="muted">
+  No Portainer, edite as variáveis do stack e faça o redeploy:
+  <code>UNIFI_HOST</code>, <code>UNIFI_SITE</code>,
+  <code>UNIFI_SERVICE_USERNAME</code>, <code>UNIFI_SERVICE_PASSWORD</code>
+  (ou <code>UNIFI_SERVICE_PASSWORD_FILE</code> apontando para um secret),
+  <code>UNIFI_VERIFY_SSL</code>.
+</p>
 {% endblock %}

@@ -1,0 +1,34 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+
+# segredos e dados locais
+.env
+*.key
+creds.enc
+*.enc
+sites_map.json
+*.db
+*.sqlite*
+*.xlsx
+data/
+backups/
+logs/
+
+# copia da instalacao de producao (fonte da migracao, nao vai para a imagem)
+_Projeto_Gerenciamento_MAC_Unifi/
+
+# artefatos da versao desktop
+dist/
+build/
+pacote/
+*.exe
+*.zip
+*.spec
+
+docs/
+*.md

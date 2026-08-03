@@ -1,0 +1,14 @@
+Flask>=3.0.0
+gunicorn>=22.0            # servidor WSGI (substitui o app.run/pywebview do desktop)
+psycopg[binary]>=3.2      # driver PostgreSQL
+psycopg-pool>=3.2         # pool de conexoes
+requests>=2.31.0
+python-dotenv>=1.0.0
+openpyxl>=3.1             # importacao de planilhas .xlsx
+
+# REMOVIDOS em relacao a versao desktop:
+#   pywebview  -> janela nativa; no Linux puxa GTK/Qt e quebra o build da imagem
+#   pyinstaller-> geracao do .exe; nao existe no servidor
+#   cryptography -> era usado para cifrar creds.enc (arquivo local por maquina).
+#                   No servidor a credencial da conta de servico vem de variavel
+#                   de ambiente / Docker secret, que ja fica fora da imagem.

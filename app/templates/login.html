@@ -25,18 +25,8 @@
         <label>Senha UniFi
           <input name="password" type="password" required>
         </label>
-        <details>
-          <summary class="muted" style="cursor:pointer;font-size:13px">Avançado (servidor / banco)</summary>
-          <label style="margin-top:8px">Host do controller
-            <input name="host" value="{{ host }}" placeholder="https://IP-DO-CONTROLLER">
-          </label>
-          <label style="margin-top:8px">Pasta do banco (rede)
-            <input name="db_folder" value="{{ db_folder }}"
-                   placeholder="\\SERVIDOR\Compartilhada\GestaoMAC\data">
-          </label>
-          <span class="muted" style="font-size:12px">Aponte para a pasta de rede
-          compartilhada para usar o mesmo banco entre vários PCs.</span>
-        </details>
+        {# Host do controller e pasta do banco eram configuraveis aqui na versao
+           desktop. No servidor vem do stack (UNIFI_HOST / DATABASE_URL). #}
         <button class="btn primary" type="submit">Entrar</button>
       </form>
       <p class="muted" style="font-size:12px;margin-top:10px">
@@ -45,12 +35,7 @@
       <p class="muted" style="font-size:11px;text-align:center;margin:6px 0 0">UniFi {{ app_version }}{% if brand %} · {{ brand }}{% endif %}</p>
     </div>
   </div>
-  <script>
-  // heartbeat na tela de login -> mantem o app vivo enquanto ninguem logou ainda
-  (function(){
-    function ping(){ fetch("{{ url_for('api_ping') }}",{method:"POST"}).catch(function(){}); }
-    ping(); setInterval(ping, 25000);
-  })();
-  </script>
+  {# O heartbeat que existia aqui servia so para manter vivo o processo do
+     desktop (watchdog do iniciar.py). No servidor nao existe watchdog. #}
 </body>
 </html>

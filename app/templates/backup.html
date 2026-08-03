@@ -1,15 +1,15 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Backup</h1>
-<p class="muted">Gere cópias de segurança. Os arquivos também ficam salvos na
-pasta <code>backups\</code> ao lado do programa.</p>
+<p class="muted">Gere cópias de segurança. Os arquivos também ficam salvos no
+volume de dados do servidor.</p>
 
 <div class="cards">
   <div class="chartbox grow">
     <h2 class="sec">Banco completo (recomendado)</h2>
     <p class="muted">Cópia íntegra de tudo: histórico, cadastros, auditoria e
     configurações. É o backup "vivo" do sistema.</p>
-    <a class="btn primary" href="{{ url_for('backup_db') }}">⬇ Baixar banco (.db)</a>
+    <a class="btn primary" href="{{ url_for('backup_db') }}">⬇ Baixar banco (.dump)</a>
   </div>
   <div class="chartbox grow">
     <h2 class="sec">Inventário (planilha)</h2>
@@ -33,15 +33,16 @@ pasta <code>backups\</code> ao lado do programa.</p>
     {% endfor %}
   </tbody>
 </table>
-<p class="muted">Pasta: <code>backups\</code> (ao lado do .exe / do app).</p>
+<p class="muted">Volume de dados do servidor (<code>/data/backups</code>).</p>
 {% else %}
 <p class="muted">Nenhum backup salvo ainda. Clique em um dos botões acima.</p>
 {% endif %}
 
 <p class="muted" style="margin-top:14px">
-  💡 Para transportar o sistema com os dados, copie a <b>pasta inteira</b>
-  (o <code>.exe</code> + a pasta <code>data\</code> com <code>history.db</code> e
-  <code>secret.key</code>). Restaurar = substituir o <code>history.db</code> por
-  um backup (com o app fechado).
+  💡 O arquivo <code>.dump</code> é um backup do PostgreSQL em formato custom.
+  Para restaurar:
+  <code>pg_restore --clean --if-exists -d "$DATABASE_URL" arquivo.dump</code>.
+  Os dados moram no volume do container <code>db</code> — inclua esse volume na
+  rotina de backup do servidor.
 </p>
 {% endblock %}

@@ -1,4 +1,8 @@
-"""Persistencia em SQLite com merge historico das coletas.
+"""Persistencia em PostgreSQL com merge historico das coletas.
+
+Migrado do SQLite preservando a API publica: todas as funcoes mantem o mesmo
+nome e a mesma assinatura da versao desktop, de modo que app.py e os templates
+seguem praticamente inalterados.
 
 A cada coleta guardamos, por (site, mac), o MAIOR last_seen ja observado
 (controller + nossas coletas). Um MAC so e considerado DISPONIVEL (liberavel)
@@ -14,9 +18,14 @@ Tratamento de "nunca conectou":
 from __future__ import annotations
 
 import os
-import sqlite3
 import time
 from collections import defaultdict
+from contextlib import contextmanager
+from typing import Iterator
+
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 AVAILABLE_DAYS = 35
 MAC_FILTER_CAP = 512
@@ -33,137 +42,98 @@ STATUS_LABEL = {
 }
 UNUSED_STATUSES = {"stale", "abandoned", "never"}
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS collections(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS mac_state(
-    site_id        TEXT NOT NULL,
-    site_desc      TEXT,
-    wlan_id        TEXT,
-    wlan_name      TEXT,
-    mac            TEXT NOT NULL,
-    name           TEXT,
-    hostname       TEXT,
-    oui            TEXT,
-    in_allow_list  INTEGER NOT NULL DEFAULT 1,
-    blocked        INTEGER NOT NULL DEFAULT 0,
-    last_seen      INTEGER NOT NULL DEFAULT 0,   -- 0 = nunca visto
-    last_online    INTEGER NOT NULL DEFAULT 0,
-    first_seen     INTEGER NOT NULL DEFAULT 0,
-    first_collected INTEGER NOT NULL,
-    last_collected  INTEGER NOT NULL,
-    PRIMARY KEY (site_id, mac)
-);
-CREATE TABLE IF NOT EXISTS seen_history(
-    collection_id INTEGER, site_id TEXT, mac TEXT, online INTEGER, last_seen INTEGER
-);
--- Auditoria: cada transicao detectada entre coletas.
--- event: cadastrado | voltou | removido | bloqueado | desbloqueado
-CREATE TABLE IF NOT EXISTS events(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts INTEGER NOT NULL,
-    site_id TEXT, site_desc TEXT,
-    mac TEXT NOT NULL,
-    event TEXT NOT NULL,
-    detail TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_events_mac ON events(mac);
-CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
--- Configuracoes (login do app, credenciais do UniFi criptografadas, etc.)
-CREATE TABLE IF NOT EXISTS settings(
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
--- Travas de edicao (aviso de uso simultaneo no cadastro do cliente)
-CREATE TABLE IF NOT EXISTS edit_locks(
-    mac TEXT PRIMARY KEY,
-    who TEXT,
-    ts  INTEGER
-);
--- Espelho do log NATIVO de atividade da UniFi (preservado para sempre)
-CREATE TABLE IF NOT EXISTS unifi_audit(
-    uid       TEXT PRIMARY KEY,   -- id do registro na UniFi (dedup)
-    ts        INTEGER,            -- timestamp do evento (epoch)
-    site_id   TEXT, site_desc TEXT,
-    key       TEXT, operation TEXT, actor TEXT,
-    message   TEXT, raw TEXT,
-    imported_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_uaudit_ts ON unifi_audit(ts);
--- Presenca: sessoes ativas do app (para "N conectados" e escalonar coleta)
-CREATE TABLE IF NOT EXISTS active_sessions(
-    sid   TEXT PRIMARY KEY,       -- id da sessao (cookie)
-    who   TEXT, machine TEXT,
-    last_ping INTEGER
-);
--- Travas de escrita por WLAN (serializa add/remover/troca no mesmo site)
-CREATE TABLE IF NOT EXISTS wlan_locks(
-    key TEXT PRIMARY KEY,         -- site_id:wlan_id
-    who TEXT, ts INTEGER
-);
--- Cadastro do cliente (dados de RH/negocio por MAC). Persiste mesmo quando o
--- MAC sai da allow-list -> aparece em "Usuarios removidos" sem perder os dados.
-CREATE TABLE IF NOT EXISTS client_info(
-    mac        TEXT PRIMARY KEY,
-    nome       TEXT, setor TEXT, unidade TEXT, funcao TEXT,
-    lider      TEXT, chamado TEXT, notes TEXT,
-    gestor_autorizou TEXT,
-    termo      INTEGER NOT NULL DEFAULT 0,
-    vip        INTEGER NOT NULL DEFAULT 0,
-    created_at INTEGER, updated_at INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_state_site ON mac_state(site_id, in_allow_list);
-CREATE INDEX IF NOT EXISTS idx_state_mac ON mac_state(mac);
-"""
-
 CLIENT_FIELDS = ["nome", "setor", "unidade", "funcao", "lider",
                  "gestor_autorizou", "chamado", "notes"]
 
 
-def _migrate(conn) -> None:
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(mac_state)")}
-    if "hostname" not in cols:
-        conn.execute("ALTER TABLE mac_state ADD COLUMN hostname TEXT")
-    if "first_seen" not in cols:
-        conn.execute("ALTER TABLE mac_state ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0")
-    if "blocked" not in cols:
-        conn.execute("ALTER TABLE mac_state ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
-    ccols = {r[1] for r in conn.execute("PRAGMA table_info(client_info)")}
-    if ccols and "vip" not in ccols:
-        conn.execute("ALTER TABLE client_info ADD COLUMN vip INTEGER NOT NULL DEFAULT 0")
-    if ccols and "gestor_autorizou" not in ccols:
-        conn.execute("ALTER TABLE client_info ADD COLUMN gestor_autorizou TEXT")
-    if ccols and "termo" not in ccols:
-        conn.execute("ALTER TABLE client_info ADD COLUMN termo INTEGER NOT NULL DEFAULT 0")
-    conn.commit()
+# ============================================================ conexao / pool
+_pool: ConnectionPool | None = None
 
 
-def default_path() -> str:
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "data", "history.db")
+def dsn_from_env() -> str:
+    """DSN do PostgreSQL. Aceita DATABASE_URL inteiro ou as partes PG*."""
+    url = os.getenv("DATABASE_URL")
+    if url:
+        return url
+    host = os.getenv("PGHOST", "db")
+    port = os.getenv("PGPORT", "5432")
+    name = os.getenv("PGDATABASE", "gestaomac")
+    user = os.getenv("PGUSER", "gestaomac")
+    pw = os.getenv("PGPASSWORD", "")
+    return f"postgresql://{user}:{pw}@{host}:{port}/{name}"
 
 
-def connect(path: str | None = None) -> sqlite3.Connection:
-    path = path or default_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # timeout alto: em pasta de rede (SMB), espera o lock em vez de falhar com
-    # "database is locked". NAO usamos WAL (nao funciona em compartilhamento).
-    conn = sqlite3.connect(path, timeout=20)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=20000")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    return conn
+def init_pool(dsn: str | None = None, min_size: int = 1,
+              max_size: int = 10) -> ConnectionPool:
+    """Cria o pool (idempotente).
+
+    Substitui o connect()/close() por request da versao SQLite: abrir conexao
+    no PostgreSQL custa caro demais para se fazer a cada tela.
+    """
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            dsn or dsn_from_env(),
+            min_size=min_size, max_size=max_size,
+            kwargs={"row_factory": dict_row},
+            open=True,
+        )
+    return _pool
 
 
+def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
+
+
+@contextmanager
+def connection() -> Iterator[psycopg.Connection]:
+    """Conexao do pool, devolvida automaticamente ao sair do bloco.
+
+        with db.connection() as conn:
+            ...
+    """
+    with init_pool().connection() as conn:
+        yield conn
+
+
+def wait_ready(timeout: float = 60.0) -> None:
+    """Espera o banco aceitar conexao (o container do app sobe antes do db)."""
+    end = time.time() + timeout
+    last: Exception | None = None
+    while time.time() < end:
+        try:
+            with connection() as conn:
+                conn.execute("SELECT 1")
+            return
+        except Exception as exc:      # noqa: BLE001 -- qualquer falha = ainda subindo
+            last = exc
+            close_pool()              # pool nasce quebrado se o db recusou
+            time.sleep(1.0)
+    raise RuntimeError(f"PostgreSQL nao respondeu em {timeout:.0f}s: {last}")
+
+
+def apply_schema(schema_path: str | None = None) -> None:
+    """Aplica db/schema.sql (idempotente: tudo e CREATE ... IF NOT EXISTS)."""
+    if schema_path is None:
+        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        schema_path = os.getenv("SCHEMA_PATH") or os.path.join(
+            app_dir, "db", "schema.sql")
+    with open(schema_path, encoding="utf-8") as fh:
+        sql = fh.read()
+    with connection() as conn:
+        conn.execute(sql)
+        conn.commit()
+
+
+# ================================================================== escrita
 _UPSERT = """
 INSERT INTO mac_state
   (site_id, site_desc, wlan_id, wlan_name, mac, name, hostname, oui, blocked,
    in_allow_list, last_seen, last_online, first_seen, first_collected, last_collected)
-VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?)
+VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s,%s,%s)
 ON CONFLICT(site_id, mac) DO UPDATE SET
   site_desc   = excluded.site_desc,
   wlan_id     = excluded.wlan_id,
@@ -173,17 +143,17 @@ ON CONFLICT(site_id, mac) DO UPDATE SET
   oui         = CASE WHEN excluded.oui      <> '' THEN excluded.oui      ELSE mac_state.oui      END,
   blocked     = excluded.blocked,
   in_allow_list = 1,
-  last_seen   = MAX(mac_state.last_seen,  excluded.last_seen),
-  last_online = MAX(mac_state.last_online, excluded.last_online),
+  last_seen   = GREATEST(mac_state.last_seen,   excluded.last_seen),
+  last_online = GREATEST(mac_state.last_online, excluded.last_online),
   first_seen  = CASE
                   WHEN mac_state.first_seen = 0 THEN excluded.first_seen
                   WHEN excluded.first_seen  = 0 THEN mac_state.first_seen
-                  ELSE MIN(mac_state.first_seen, excluded.first_seen) END,
+                  ELSE LEAST(mac_state.first_seen, excluded.first_seen) END,
   last_collected = excluded.last_collected
 """
 
 
-def record_snapshot(conn: sqlite3.Connection, rows: list[dict], ts: int) -> dict:
+def record_snapshot(conn, rows: list[dict], ts: int) -> dict:
     """Grava uma coleta, mesclando com o historico. Marca como removido (
     in_allow_list=0) quem sumiu da lista de um site presente nesta coleta."""
     had_prior = _count_collections(conn) > 0
@@ -192,11 +162,15 @@ def record_snapshot(conn: sqlite3.Connection, rows: list[dict], ts: int) -> dict
             for r in conn.execute(
                 "SELECT site_id, mac, in_allow_list, blocked FROM mac_state")}
 
-    cur = conn.execute("INSERT INTO collections(ts) VALUES (?)", (ts,))
-    cid = cur.lastrowid
+    # SQLite: cur.lastrowid -> PostgreSQL: RETURNING id
+    cid = conn.execute(
+        "INSERT INTO collections(ts) VALUES (%s) RETURNING id", (ts,)
+    ).fetchone()["id"]
     events: list[tuple] = []
 
     current: dict[str, set] = defaultdict(set)
+    upserts: list[tuple] = []
+    seen_rows: list[tuple] = []
     for r in rows:
         current[r["site_id"]].add(r["mac"])
         ls = r.get("last_seen") or 0
@@ -223,29 +197,37 @@ def record_snapshot(conn: sqlite3.Connection, rows: list[dict], ts: int) -> dict
                 events.append((ts, r["site_id"], r["site_desc"], r["mac"],
                                "bloqueado" if new_blk else "desbloqueado", ""))
 
-        conn.execute(_UPSERT, (
+        upserts.append((
             r["site_id"], r["site_desc"], r["wlan_id"], r["wlan_name"], r["mac"],
             r.get("name") or "", r.get("hostname") or "", r.get("oui") or "",
             new_blk,
             eff_seen, last_online, r.get("first_seen") or 0, ts, ts,
         ))
-        conn.execute(
-            "INSERT INTO seen_history(collection_id, site_id, mac, online, last_seen)"
-            " VALUES (?,?,?,?,?)",
-            (cid, r["site_id"], r["mac"], 1 if r["online"] else 0, ls),
-        )
+        seen_rows.append(
+            (cid, r["site_id"], r["mac"], 1 if r["online"] else 0, ls))
+
+    # Em lote: ~1.500 MACs por coleta dariam 3.000 idas e voltas uma a uma.
+    with conn.cursor() as cur:
+        if upserts:
+            cur.executemany(_UPSERT, upserts)
+        if seen_rows:
+            cur.executemany(
+                "INSERT INTO seen_history(collection_id, site_id, mac, online, last_seen)"
+                " VALUES (%s,%s,%s,%s,%s)", seen_rows)
 
     vips = vip_macs(conn)
     removed = 0
     for site_id, macs in current.items():
         existing = conn.execute(
             "SELECT mac, site_desc FROM mac_state "
-            "WHERE site_id=? AND in_allow_list=1", (site_id,)).fetchall()
-        for row in existing:
-            if row["mac"] not in macs:
-                conn.execute(
-                    "UPDATE mac_state SET in_allow_list=0, last_collected=? "
-                    "WHERE site_id=? AND mac=?", (ts, site_id, row["mac"]))
+            "WHERE site_id=%s AND in_allow_list=1", (site_id,)).fetchall()
+        gone = [row for row in existing if row["mac"] not in macs]
+        if gone:
+            conn.execute(
+                "UPDATE mac_state SET in_allow_list=0, last_collected=%s "
+                "WHERE site_id=%s AND mac = ANY(%s)",
+                (ts, site_id, [row["mac"] for row in gone]))
+            for row in gone:
                 is_vip = row["mac"] in vips
                 events.append((ts, site_id, row["site_desc"], row["mac"],
                                "vip_removido" if is_vip else "removido",
@@ -254,18 +236,19 @@ def record_snapshot(conn: sqlite3.Connection, rows: list[dict], ts: int) -> dict
                 removed += 1
 
     if events:
-        conn.executemany(
-            "INSERT INTO events(ts, site_id, site_desc, mac, event, detail) "
-            "VALUES (?,?,?,?,?,?)", events)
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO events(ts, site_id, site_desc, mac, event, detail) "
+                "VALUES (%s,%s,%s,%s,%s,%s)", events)
     conn.commit()
     return {"collection_id": cid, "rows": len(rows),
             "marked_removed": removed, "events": len(events)}
 
 
-# ---------------------------------------------------------------- leitura
+# ================================================================== leitura
 def _latest_ts(conn) -> int:
     r = conn.execute("SELECT MAX(ts) AS t FROM collections").fetchone()
-    return r["t"] or 0
+    return (r["t"] if r else 0) or 0
 
 
 def _classify(last_seen, first_collected, online, now, days, never_mode):
@@ -288,9 +271,20 @@ def _classify(last_seen, first_collected, online, now, days, never_mode):
     return ("never", None) if age > days else ("pending", None)
 
 
-def _row_view(r, now, days, never_mode):
+def _is_online(r, latest: int) -> bool:
+    """Online se a coleta mais recente o viu online.
+
+    `latest` chega por parametro. Na versao SQLite vinha de um dict global de
+    modulo (_LATEST) que site_inventory/overview_summary escreviam e esta
+    funcao lia -- com gunicorn multi-thread, duas requisicoes concorrentes se
+    sobrescreviam e o status "online" saia errado.
+    """
+    return bool(r["last_online"] and r["last_online"] == latest)
+
+
+def _row_view(r, now, days, never_mode, latest: int):
     status, didle = _classify(r["last_seen"], r["first_collected"],
-                              _is_online(r, now), now, days, never_mode)
+                              _is_online(r, latest), now, days, never_mode)
     return {
         "mac": r["mac"], "name": r["name"] or "", "oui": r["oui"] or "",
         "online": status == "online",
@@ -303,23 +297,15 @@ def _row_view(r, now, days, never_mode):
     }
 
 
-_LATEST = {"ts": 0}
-
-
-def _is_online(r, now):
-    # online se a ultima coleta o viu online (last_online == ts da coleta mais recente)
-    return r["last_online"] and r["last_online"] == _LATEST["ts"]
-
-
 def site_inventory(conn, site_id, wlan_id, days=AVAILABLE_DAYS,
                    never_mode="grace", cap=MAC_FILTER_CAP):
-    _LATEST["ts"] = _latest_ts(conn)
+    latest = _latest_ts(conn)
     now = int(time.time())
-    q = ("SELECT * FROM mac_state WHERE site_id=? AND in_allow_list=1"
-         + (" AND wlan_id=?" if wlan_id else ""))
+    q = ("SELECT * FROM mac_state WHERE site_id=%s AND in_allow_list=1"
+         + (" AND wlan_id=%s" if wlan_id else ""))
     args = (site_id, wlan_id) if wlan_id else (site_id,)
     db_rows = conn.execute(q, args).fetchall()
-    rows = [_row_view(r, now, days, never_mode) for r in db_rows]
+    rows = [_row_view(r, now, days, never_mode, latest) for r in db_rows]
 
     vips = vip_macs(conn)
     for r in rows:
@@ -355,7 +341,7 @@ def site_inventory(conn, site_id, wlan_id, days=AVAILABLE_DAYS,
 
 def overview_summary(conn, days=AVAILABLE_DAYS, never_mode="grace",
                      cap=MAC_FILTER_CAP):
-    _LATEST["ts"] = _latest_ts(conn)
+    latest = _latest_ts(conn)
     now = int(time.time())
     db_rows = conn.execute(
         "SELECT * FROM mac_state WHERE in_allow_list=1").fetchall()
@@ -368,7 +354,7 @@ def overview_summary(conn, days=AVAILABLE_DAYS, never_mode="grace",
     dist = {"online": 0, "ate30": 0, "31-50": 0, "51-100": 0, ">100": 0, "never": 0}
 
     for r in db_rows:
-        v = _row_view(r, now, days, never_mode)
+        v = _row_view(r, now, days, never_mode, latest)
         sid = r["site_id"]
         p = per.setdefault(sid, {
             "site_id": sid, "site_desc": r["site_desc"],
@@ -420,7 +406,7 @@ def overview_summary(conn, days=AVAILABLE_DAYS, never_mode="grace",
     tot["free"] = sum(s["free"] for s in sites)
 
     return {"totals": tot, "sites": sites, "dist": dist, "days": days,
-            "latest_ts": _LATEST["ts"], "collections": _count_collections(conn)}
+            "latest_ts": latest, "collections": _count_collections(conn)}
 
 
 def _count_collections(conn) -> int:
@@ -430,7 +416,7 @@ def _count_collections(conn) -> int:
 def site_wlans(conn, site_id) -> list[dict]:
     rows = conn.execute(
         "SELECT DISTINCT wlan_id, wlan_name FROM mac_state "
-        "WHERE site_id=? AND in_allow_list=1", (site_id,)).fetchall()
+        "WHERE site_id=%s AND in_allow_list=1", (site_id,)).fetchall()
     return [{"_id": r["wlan_id"], "name": r["wlan_name"]}
             for r in rows if r["wlan_id"]]
 
@@ -439,38 +425,59 @@ def has_data(conn) -> bool:
     return _count_collections(conn) > 0
 
 
-# ------------------------------------------------------------- settings
+# ================================================================= settings
 def get_setting(conn, key, default=None):
-    r = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    r = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
     return r["value"] if r else default
 
 
 def set_setting(conn, key, value) -> None:
     conn.execute(
-        "INSERT INTO settings(key, value) VALUES(?,?) "
+        "INSERT INTO settings(key, value) VALUES(%s,%s) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, "" if value is None else str(value)))
     conn.commit()
 
 
-# ----------------------------------------------- travas de edicao (locks)
+def get_or_create_setting(conn, key, factory) -> str:
+    """Le a chave; se nao existir, grava o valor de factory() e devolve o que
+    de fato ficou gravado.
+
+    DO NOTHING + releitura (em vez de set_setting) porque varios workers sobem
+    ao mesmo tempo: com DO UPDATE, dois deles gerariam segredos diferentes e o
+    ultimo sobrescreveria o primeiro, invalidando as sessoes ja emitidas.
+    Aqui o primeiro a gravar vence e todos leem o mesmo valor.
+    """
+    r = conn.execute("SELECT value FROM settings WHERE key=%s", (key,)).fetchone()
+    if r and r["value"]:
+        return r["value"]
+    conn.execute(
+        "INSERT INTO settings(key, value) VALUES(%s,%s) ON CONFLICT(key) DO NOTHING",
+        (key, factory()))
+    conn.commit()
+    return conn.execute(
+        "SELECT value FROM settings WHERE key=%s", (key,)).fetchone()["value"]
+
+
+# ==================================================== travas de edicao (locks)
 def get_lock(conn, mac) -> dict | None:
-    r = conn.execute("SELECT who, ts FROM edit_locks WHERE mac=?",
+    r = conn.execute("SELECT who, ts FROM edit_locks WHERE mac=%s",
                      (mac.lower(),)).fetchone()
     return dict(r) if r else None
 
 
 def set_lock(conn, mac, who, ts) -> None:
     conn.execute(
-        "INSERT INTO edit_locks(mac, who, ts) VALUES(?,?,?) "
+        "INSERT INTO edit_locks(mac, who, ts) VALUES(%s,%s,%s) "
         "ON CONFLICT(mac) DO UPDATE SET who=excluded.who, ts=excluded.ts",
         (mac.lower(), who, ts))
     conn.commit()
 
 
-# ----------------------------------------------------- cadastro de cliente
+# =========================================================== cadastro cliente
 def get_client_info(conn, mac) -> dict | None:
-    r = conn.execute("SELECT * FROM client_info WHERE mac=?", (mac.lower(),)).fetchone()
+    r = conn.execute("SELECT * FROM client_info WHERE mac=%s",
+                     (mac.lower(),)).fetchone()
     return dict(r) if r else None
 
 
@@ -478,12 +485,12 @@ def upsert_client_info(conn, mac, fields: dict) -> None:
     mac = mac.lower()
     now = int(time.time())
     cols = ",".join(CLIENT_FIELDS)
-    ph = ",".join(["?"] * len(CLIENT_FIELDS))
+    ph = ",".join(["%s"] * len(CLIENT_FIELDS))
     sets = ",".join(f"{k}=excluded.{k}" for k in CLIENT_FIELDS)
     vals = [(fields.get(k) or "").strip() for k in CLIENT_FIELDS]
     conn.execute(
         f"INSERT INTO client_info(mac,{cols},created_at,updated_at) "
-        f"VALUES(?,{ph},?,?) "
+        f"VALUES(%s,{ph},%s,%s) "
         f"ON CONFLICT(mac) DO UPDATE SET {sets}, updated_at=excluded.updated_at",
         [mac] + vals + [now, now])
     conn.commit()
@@ -491,28 +498,28 @@ def upsert_client_info(conn, mac, fields: dict) -> None:
 
 def set_vip(conn, mac, vip: bool) -> None:
     """Marca/desmarca um MAC como prioritario (VIP/Diretoria)."""
-    conn.execute("UPDATE client_info SET vip=?, updated_at=? WHERE mac=?",
+    conn.execute("UPDATE client_info SET vip=%s, updated_at=%s WHERE mac=%s",
                  (1 if vip else 0, int(time.time()), mac.lower()))
     conn.commit()
 
 
 def set_termo(conn, mac, termo: bool) -> None:
     """Marca/desmarca se o termo do cliente foi assinado/entregue."""
-    conn.execute("UPDATE client_info SET termo=?, updated_at=? WHERE mac=?",
+    conn.execute("UPDATE client_info SET termo=%s, updated_at=%s WHERE mac=%s",
                  (1 if termo else 0, int(time.time()), mac.lower()))
     conn.commit()
 
 
 def vip_alerts(conn) -> list[dict]:
     """MACs marcados como VIP que NAO estao mais na allow-list (alerta!)."""
-    active = {r["mac"] for r in conn.execute(
-        "SELECT DISTINCT mac FROM mac_state WHERE in_allow_list=1")}
-    out = []
-    for r in conn.execute("SELECT mac, nome, setor FROM client_info WHERE vip=1"):
-        if r["mac"] not in active:
-            out.append({"mac": r["mac"], "nome": r["nome"] or "",
-                        "setor": r["setor"] or ""})
-    return out
+    rows = conn.execute("""
+        SELECT c.mac, c.nome, c.setor FROM client_info c
+        WHERE c.vip = 1 AND NOT EXISTS (
+            SELECT 1 FROM mac_state m
+            WHERE m.mac = c.mac AND m.in_allow_list = 1)
+    """).fetchall()
+    return [{"mac": r["mac"], "nome": r["nome"] or "", "setor": r["setor"] or ""}
+            for r in rows]
 
 
 def vip_macs(conn) -> set:
@@ -523,7 +530,7 @@ def vip_macs(conn) -> set:
 def device_detail(conn, mac) -> dict | None:
     """Tudo que sabemos do aparelho (infos da UniFi mescladas) + presenca por site."""
     mac = mac.lower()
-    rows = conn.execute("SELECT * FROM mac_state WHERE mac=?", (mac,)).fetchall()
+    rows = conn.execute("SELECT * FROM mac_state WHERE mac=%s", (mac,)).fetchall()
     if not rows:
         return None
     latest = _latest_ts(conn)
@@ -552,6 +559,7 @@ def device_detail(conn, mac) -> dict | None:
     }
 
 
+# GROUP_CONCAT(DISTINCT x) do SQLite -> string_agg(DISTINCT x, ', ') no PostgreSQL.
 _AGG = """
 SELECT mac,
   MAX(in_allow_list)            AS active,
@@ -561,7 +569,7 @@ SELECT mac,
   MAX(NULLIF(oui,''))           AS oui,
   MAX(COALESCE(last_seen,0))    AS last_seen,
   MAX(COALESCE(last_online,0))  AS last_online,
-  GROUP_CONCAT(DISTINCT CASE WHEN in_allow_list=1 THEN site_desc END) AS sites
+  string_agg(DISTINCT CASE WHEN in_allow_list=1 THEN site_desc END, ', ') AS sites
 FROM mac_state GROUP BY mac
 """
 
@@ -659,6 +667,7 @@ def backup_rows(conn) -> list[dict]:
     return out
 
 
+# ================================================================ auditoria
 EVENT_LABEL = {
     "cadastrado": "Cadastrado", "voltou": "Voltou", "removido": "Removido",
     "bloqueado": "Bloqueado", "desbloqueado": "Desbloqueado",
@@ -671,14 +680,14 @@ EVENT_LABEL = {
 def add_event(conn, ts, site_id, site_desc, mac, event, detail="") -> None:
     conn.execute(
         "INSERT INTO events(ts, site_id, site_desc, mac, event, detail) "
-        "VALUES (?,?,?,?,?,?)",
+        "VALUES (%s,%s,%s,%s,%s,%s)",
         (ts, site_id, site_desc, mac.lower(), event, detail))
     conn.commit()
 
 
 def events_for_mac(conn, mac, limit=200) -> list[dict]:
     rows = conn.execute(
-        "SELECT * FROM events WHERE mac=? ORDER BY ts DESC, id DESC LIMIT ?",
+        "SELECT * FROM events WHERE mac=%s ORDER BY ts DESC, id DESC LIMIT %s",
         (mac.lower(), limit)).fetchall()
     return [dict(r) for r in rows]
 
@@ -687,13 +696,13 @@ def recent_events(conn, event=None, search=None, limit=500) -> list[dict]:
     q = "SELECT * FROM events"
     args, where = [], []
     if event:
-        where.append("event=?"); args.append(event)
+        where.append("event=%s"); args.append(event)
     if search:
         s = f"%{search.strip()}%"
-        where.append("(mac LIKE ? OR site_desc LIKE ?)"); args += [s, s]
+        where.append("(mac LIKE %s OR site_desc LIKE %s)"); args += [s, s]
     if where:
         q += " WHERE " + " AND ".join(where)
-    q += " ORDER BY ts DESC, id DESC LIMIT ?"; args.append(limit)
+    q += " ORDER BY ts DESC, id DESC LIMIT %s"; args.append(limit)
     return [dict(r) for r in conn.execute(q, args)]
 
 
@@ -712,30 +721,43 @@ def last_event_ts(conn) -> dict:
 
 
 def removed_macs_with_info(conn) -> int:
-    info = {r["mac"] for r in conn.execute("SELECT mac FROM client_info")}
-    if not info:
-        return 0
-    active = {r["mac"] for r in conn.execute(
-        "SELECT DISTINCT mac FROM mac_state WHERE in_allow_list=1")}
-    return len(info - active)
+    """Quantos cadastros existem cujo MAC nao esta mais em nenhuma allow-list."""
+    r = conn.execute("""
+        SELECT COUNT(*) AS c FROM client_info c
+        WHERE NOT EXISTS (
+            SELECT 1 FROM mac_state m
+            WHERE m.mac = c.mac AND m.in_allow_list = 1)
+    """).fetchone()
+    return r["c"]
 
 
-# ============================ v4: log UniFi / presenca / leases ============
+# ==================================== log nativo da UniFi / presenca / leases
 def upsert_unifi_audit(conn, rows) -> int:
-    """Insere registros do log nativo da UniFi (dedup por uid). Retorna novos."""
+    """Insere registros do log nativo da UniFi (dedup por uid). Retorna novos.
+
+    INSERT OR IGNORE (SQLite) -> ON CONFLICT DO NOTHING (PostgreSQL).
+    """
+    if not rows:
+        return 0
     now = int(time.time())
-    novos = 0
-    for r in rows:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO unifi_audit"
+    payload = [
+        (r["uid"], r.get("ts"), r.get("site_id"), r.get("site_desc"),
+         r.get("key"), r.get("operation"), r.get("actor"),
+         r.get("message"), r.get("raw"), now)
+        for r in rows
+    ]
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO unifi_audit"
             "(uid, ts, site_id, site_desc, key, operation, actor, message, raw, imported_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (r["uid"], r.get("ts"), r.get("site_id"), r.get("site_desc"),
-             r.get("key"), r.get("operation"), r.get("actor"),
-             r.get("message"), r.get("raw"), now))
-        novos += cur.rowcount
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+            " ON CONFLICT(uid) DO NOTHING",
+            payload)
+        # Apos executemany, rowcount e o total afetado por TODAS as execucoes.
+        # Como o conflito nao afeta linha nenhuma, isso ja e a contagem de novos.
+        novos = cur.rowcount
     conn.commit()
-    return novos
+    return max(novos, 0)
 
 
 def list_unifi_audit(conn, search=None, limit=500) -> list[dict]:
@@ -743,9 +765,9 @@ def list_unifi_audit(conn, search=None, limit=500) -> list[dict]:
     args = []
     if search:
         s = f"%{search.strip()}%"
-        q += " WHERE (actor LIKE ? OR message LIKE ? OR site_desc LIKE ? OR key LIKE ?)"
+        q += " WHERE (actor LIKE %s OR message LIKE %s OR site_desc LIKE %s OR key LIKE %s)"
         args = [s, s, s, s]
-    q += " ORDER BY ts DESC, uid DESC LIMIT ?"
+    q += " ORDER BY ts DESC, uid DESC LIMIT %s"
     args.append(limit)
     return [dict(r) for r in conn.execute(q, args)]
 
@@ -754,10 +776,10 @@ def unifi_audit_count(conn) -> int:
     return conn.execute("SELECT COUNT(*) AS c FROM unifi_audit").fetchone()["c"]
 
 
-# ----------------------------------------------------------- presenca
+# ------------------------------------------------------------------ presenca
 def ping_session(conn, sid, who, machine) -> None:
     conn.execute(
-        "INSERT INTO active_sessions(sid, who, machine, last_ping) VALUES (?,?,?,?) "
+        "INSERT INTO active_sessions(sid, who, machine, last_ping) VALUES (%s,%s,%s,%s) "
         "ON CONFLICT(sid) DO UPDATE SET who=excluded.who, machine=excluded.machine, "
         "last_ping=excluded.last_ping",
         (sid, who or "", machine or "", int(time.time())))
@@ -765,13 +787,13 @@ def ping_session(conn, sid, who, machine) -> None:
 
 
 def end_session(conn, sid) -> None:
-    conn.execute("DELETE FROM active_sessions WHERE sid=?", (sid,))
+    conn.execute("DELETE FROM active_sessions WHERE sid=%s", (sid,))
     conn.commit()
 
 
 def active_sessions(conn, ttl=90) -> list[dict]:
     cut = int(time.time()) - ttl
-    conn.execute("DELETE FROM active_sessions WHERE last_ping < ?", (cut,))
+    conn.execute("DELETE FROM active_sessions WHERE last_ping < %s", (cut,))
     conn.commit()
     return [dict(r) for r in conn.execute(
         "SELECT who, machine, last_ping FROM active_sessions ORDER BY who")]
@@ -783,29 +805,56 @@ def active_count(conn, ttl=90) -> int:
 
 # --------------------------------------------- lease de coleta (turno unico)
 def claim_collection(conn, interval, who="") -> bool:
-    """Assume a coleta da janela atual de forma atomica. True = deve coletar."""
+    """Assume a coleta da janela atual de forma atomica. True = deve coletar.
+
+    O UPDATE condicional so acerta a linha para UM chamador: quem obtiver
+    rowcount==1 ganhou a janela. Mesma semantica da versao SQLite.
+
+    Mudanca: usa a tabela collect_lease (coluna BIGINT) em vez de
+    settings['last_collect_ts'] (TEXT). O CAST(value AS INTEGER) sobre TEXT
+    devolvia 0 silenciosamente no SQLite, mas LANCA EXCECAO no PostgreSQL
+    quando o valor esta vazio ou nao e numerico.
+    """
     now = int(time.time())
-    conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('last_collect_ts','0')")
     cur = conn.execute(
-        "UPDATE settings SET value=? WHERE key='last_collect_ts' "
-        "AND CAST(value AS INTEGER) <= ?", (str(now), now - interval))
+        "UPDATE collect_lease SET last_ts=%s, last_by=%s "
+        "WHERE id=1 AND last_ts <= %s", (now, who, now - interval))
     conn.commit()
-    if cur.rowcount == 1:
-        set_setting(conn, "last_collect_by", who)
-        return True
-    return False
+    return cur.rowcount == 1
+
+
+def last_collect_info(conn) -> dict:
+    r = conn.execute(
+        "SELECT last_ts, last_by FROM collect_lease WHERE id=1").fetchone()
+    return dict(r) if r else {"last_ts": 0, "last_by": ""}
 
 
 # ------------------------------------------- trava de escrita por WLAN
-def acquire_wlan_lock(conn, key, who, ttl=20) -> bool:
+# TTL 60s (era 20s no SQLite). O caminho de escrita faz get_wlan + PUT contra o
+# controller, com timeout de 15s por chamada e a possibilidade de refazer login
+# em caso de 401 -- ou seja, pode passar de 30s. Com TTL de 20s a trava expirava
+# no meio da operacao e um segundo worker entrava junto, arriscando estourar o
+# cap de 512.
+WLAN_LOCK_TTL = 60
+
+
+def acquire_wlan_lock(conn, key, who, ttl=WLAN_LOCK_TTL) -> bool:
+    """Trava exclusiva por WLAN.
+
+    O INSERT ... ON CONFLICT DO NOTHING e atomico no PostgreSQL, entao a trava
+    vale entre PROCESSOS e entre CONTAINERES -- diferente do threading.Lock da
+    versao desktop, que so valia dentro de um processo e deixava de proteger
+    assim que o app passasse a rodar com varios workers.
+    """
     now = int(time.time())
-    conn.execute("DELETE FROM wlan_locks WHERE ts < ?", (now - ttl,))
-    cur = conn.execute("INSERT OR IGNORE INTO wlan_locks(key, who, ts) VALUES (?,?,?)",
-                       (key, who or "", now))
+    conn.execute("DELETE FROM wlan_locks WHERE ts < %s", (now - ttl,))
+    cur = conn.execute(
+        "INSERT INTO wlan_locks(key, who, ts) VALUES (%s,%s,%s) "
+        "ON CONFLICT(key) DO NOTHING", (key, who or "", now))
     conn.commit()
     return cur.rowcount == 1
 
 
 def release_wlan_lock(conn, key) -> None:
-    conn.execute("DELETE FROM wlan_locks WHERE key=?", (key,))
+    conn.execute("DELETE FROM wlan_locks WHERE key=%s", (key,))
     conn.commit()

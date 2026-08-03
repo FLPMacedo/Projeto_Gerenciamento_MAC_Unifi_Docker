@@ -1,0 +1,122 @@
+# Stack do Gestao MAC UniFi — implantavel direto pelo Portainer
+# (Stacks -> Add stack -> Repository, apontando para este repositorio).
+#
+# Modulos: db (PostgreSQL) | init (schema, one-shot) | web (Flask/gunicorn)
+#          | collector (coleta agendada)
+#
+# Estao juntos de proposito, para facilitar os testes de implantacao. Para
+# segmentar depois, basta separar os servicos em stacks diferentes: eles so se
+# comunicam pelo banco.
+
+name: gestaomac
+
+services:
+  # ------------------------------------------------------------------ banco
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-gestaomac}
+      POSTGRES_USER: ${PGUSER:-gestaomac}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?defina PGPASSWORD no .env do stack}
+      TZ: ${TZ:-America/Sao_Paulo}
+      # pt_BR.UTF-8 nao existe na imagem alpine; C.UTF-8 ordena de forma
+      # estavel e e o suficiente (a ordenacao das telas e feita em Python).
+      LANG: C.UTF-8
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1 forca conexao TCP: sem isso o pg_isready responde OK pelo
+      # socket local enquanto o servidor ainda nao aceita conexoes de rede, e o
+      # web sobe cedo demais.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${PGUSER:-gestaomac} -d ${PGDATABASE:-gestaomac}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # -------------------------------------------------- schema (roda uma vez)
+  init:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: gestaomac-app:latest
+    restart: "no"
+    command: ["python", "/app/scripts/init_db.py"]
+    environment: &app_env
+      DATABASE_URL: postgresql://${PGUSER:-gestaomac}:${PGPASSWORD}@db:5432/${PGDATABASE:-gestaomac}
+      # PG* alimentam o pg_dump do botao "Baixar banco"
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: ${PGDATABASE:-gestaomac}
+      PGUSER: ${PGUSER:-gestaomac}
+      PGPASSWORD: ${PGPASSWORD}
+      # TZ importa: o codigo formata datas com time.localtime(). Sem isto o
+      # container roda em UTC e as telas mostram 3h a menos.
+      TZ: ${TZ:-America/Sao_Paulo}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      APPLY_SCHEMA: "0"          # quem aplica e o proprio init_db.py
+      # ---- UniFi (conta de servico) ----
+      UNIFI_HOST: ${UNIFI_HOST}
+      UNIFI_SITE: ${UNIFI_SITE:-default}
+      UNIFI_SERVICE_USERNAME: ${UNIFI_SERVICE_USERNAME}
+      UNIFI_SERVICE_PASSWORD: ${UNIFI_SERVICE_PASSWORD}
+      UNIFI_VERIFY_SSL: ${UNIFI_VERIFY_SSL:-false}
+      # ---- aplicacao ----
+      BRAND: ${BRAND:-}
+      UNITS: ${UNITS:-101,102,103,104,105,106,107,110,111,113,115,117}
+      NEVER_MODE: ${NEVER_MODE:-grace}
+      DATA_DIR: /data
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # -------------------------------------------------------------------- web
+  web:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: gestaomac-app:latest
+    restart: unless-stopped
+    environment:
+      <<: *app_env
+      # Segredo de sessao. Se ficar vazio, o app gera um e guarda no banco.
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:-}
+      # Quem coleta e o collector; o web so le.
+      COLLECT_ON_OPEN: "0"
+    ports:
+      - "${WEB_PORT:-8080}:5000"
+    volumes:
+      - appdata:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------------- collector
+  collector:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: gestaomac-app:latest
+    restart: unless-stopped
+    command: ["python", "/app/collect.py"]
+    environment:
+      <<: *app_env
+      COLLECT_INTERVAL: ${COLLECT_INTERVAL:-600}
+    volumes:
+      - appdata:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    # Uma replica so. O lease em collect_lease ja protege contra coleta dupla,
+    # mas nao ha ganho em subir mais de uma.
+    deploy:
+      replicas: 1
+
+volumes:
+  pgdata:
+  appdata:

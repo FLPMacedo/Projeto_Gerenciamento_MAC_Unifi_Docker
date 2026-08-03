@@ -12,14 +12,25 @@ Decisões tomadas: **conta de serviço + login por usuário** · **migrar todos 
 
 Flask + SQLite, single-process, desktop-first. 19 rotas, 11 tabelas, 4,0 MB de banco.
 
+Volume real (banco de **produção**, 26,6 MB, última coleta em 01/08/2026 10:49 —
+não confundir com a cópia de desenvolvimento, que parou em 01/07 e tem ~10× menos
+dados):
+
 | Tabela | Linhas |
 |---|---|
-| `seen_history` | 47.450 |
-| `unifi_audit` | 1.558 |
-| `mac_state` | 1.480 |
-| `client_info` | 1.135 |
-| `collections` | 32 |
-| `settings` / `events` / `edit_locks` / `active_sessions` / `wlan_locks` | 10 / 6 / 1 / 1 / 0 |
+| `seen_history` | 549.995 |
+| `unifi_audit` | 4.464 |
+| `mac_state` | 1.530 |
+| `client_info` | 1.169 |
+| `collections` | 371 |
+| `events` | 165 |
+| `edit_locks` / `settings` / `active_sessions` / `wlan_locks` | 37 / 10 / 1 / 0 |
+| **Total** | **557.742** |
+
+Conferência prévia da origem (executada): nenhum NULL em coluna que o schema novo
+exige `NOT NULL`, nenhuma chave primária duplicada, nenhum `collection_id` órfão
+em `seen_history`. Os ids vão de 1 a 371 (`collections`) e 1 a 165 (`events`) —
+daí a necessidade de reposicionar as sequências `IDENTITY` após a carga.
 
 Regras de negócio que **não mudam**: 35 dias sem logar = disponível · cap de 512 por WLAN ·
 `NEVER_MODE=grace` · VIP não removível · trava por WLAN · auditoria dupla (sistema + log nativo UniFi) ·

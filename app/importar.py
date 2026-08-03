@@ -8,11 +8,8 @@ Uso:
 """
 from __future__ import annotations
 
-import io
 import os
 import sys
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 from dotenv import load_dotenv
 
@@ -48,56 +45,55 @@ def main() -> None:
 
     records, stats = parse_workbook(path)
 
-    conn = db.connect(os.getenv("DB_PATH"))
-    active = {r["mac"] for r in conn.execute(
-        "SELECT DISTINCT mac FROM mac_state WHERE in_allow_list=1")}
+    db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "60")))
+    with db.connection() as conn:
+        active = {r["mac"] for r in conn.execute(
+            "SELECT DISTINCT mac FROM mac_state WHERE in_allow_list=1")}
 
-    print(f"\n=== {'GRAVANDO' if apply else 'SIMULACAO (nada gravado)'} :: {path} ===\n")
-    print(f"{'ABA':<24} {'unid':>5} {'linhas':>7} {'import':>7} {'sem MAC':>8}")
-    print("-" * 56)
-    for s in stats:
-        print(f"{s['sheet']:<24} {str(s['unit'] or '-'):>5} "
-              f"{s['rows']:>7} {s['imported']:>7} {s['skipped']:>8}")
+        print(f"\n=== {'GRAVANDO' if apply else 'SIMULACAO (nada gravado)'} :: {path} ===\n")
+        print(f"{'ABA':<24} {'unid':>5} {'linhas':>7} {'import':>7} {'sem MAC':>8}")
+        print("-" * 56)
+        for s in stats:
+            print(f"{s['sheet']:<24} {str(s['unit'] or '-'):>5} "
+                  f"{s['rows']:>7} {s['imported']:>7} {s['skipped']:>8}")
 
-    total_macs = len(records)
-    com_nome = sum(1 for r in records.values() if r["nome"])
-    na_rede = sum(1 for mac in records if mac in active)
-    fora = total_macs - na_rede
+        total_macs = len(records)
+        com_nome = sum(1 for r in records.values() if r["nome"])
+        na_rede = sum(1 for mac in records if mac in active)
+        fora = total_macs - na_rede
 
-    print("\n--- RESUMO ---")
-    print(f"  MACs unicos na planilha : {total_macs}")
-    print(f"  com nome                : {com_nome}")
-    print(f"  na rede (ativos)        : {na_rede}")
-    print(f"  fora da rede (-> removido/deletado, dados guardados): {fora}")
+        print("\n--- RESUMO ---")
+        print(f"  MACs unicos na planilha : {total_macs}")
+        print(f"  com nome                : {com_nome}")
+        print(f"  na rede (ativos)        : {na_rede}")
+        print(f"  fora da rede (-> removido/deletado, dados guardados): {fora}")
 
-    if not apply:
-        print("\n  Amostra (5 primeiros):")
-        for mac, rec in list(records.items())[:5]:
+        if not apply:
+            print("\n  Amostra (5 primeiros):")
+            for mac, rec in list(records.items())[:5]:
+                f = finalize(rec)
+                print(f"   {mac} | {f['nome'][:30]:<30} | unid={f['unidade'] or '-':<10} "
+                      f"| setor={f['setor'][:14]}")
+            print("\n>> SIMULACAO. Para gravar de fato rode novamente com --apply")
+            return
+
+        # grava (merge com cadastro existente)
+        written = 0
+        for mac, rec in records.items():
             f = finalize(rec)
-            print(f"   {mac} | {f['nome'][:30]:<30} | unid={f['unidade'] or '-':<10} "
-                  f"| setor={f['setor'][:14]}")
-        print("\n>> SIMULACAO. Para gravar de fato rode novamente com --apply")
-        conn.close()
-        return
-
-    # grava (merge com cadastro existente)
-    written = 0
-    for mac, rec in records.items():
-        f = finalize(rec)
-        cur = db.get_client_info(conn, mac) or {}
-        merged = {
-            "nome": f["nome"] or cur.get("nome", ""),
-            "setor": f["setor"] or cur.get("setor", ""),
-            "funcao": f["funcao"] or cur.get("funcao", ""),
-            "lider": f["lider"] or cur.get("lider", ""),
-            "chamado": f["chamado"] or cur.get("chamado", ""),
-            "unidade": _merge_units(cur.get("unidade", ""), f["unidade"]),
-            "notes": _merge_notes(cur.get("notes", ""), f["notes"]),
-        }
-        db.upsert_client_info(conn, mac, merged)
-        written += 1
-    conn.close()
-    print(f"\n  GRAVADO: {written} cadastro(s) em client_info.")
+            cur = db.get_client_info(conn, mac) or {}
+            merged = {
+                "nome": f["nome"] or cur.get("nome", ""),
+                "setor": f["setor"] or cur.get("setor", ""),
+                "funcao": f["funcao"] or cur.get("funcao", ""),
+                "lider": f["lider"] or cur.get("lider", ""),
+                "chamado": f["chamado"] or cur.get("chamado", ""),
+                "unidade": _merge_units(cur.get("unidade", ""), f["unidade"]),
+                "notes": _merge_notes(cur.get("notes", ""), f["notes"]),
+            }
+            db.upsert_client_info(conn, mac, merged)
+            written += 1
+        print(f"\n  GRAVADO: {written} cadastro(s) em client_info.")
 
 
 if __name__ == "__main__":

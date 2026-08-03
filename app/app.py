@@ -1,9 +1,17 @@
 """Aplicacao web (Flask) para gestao multi-site dos MACs da rede mobile UniFi.
 
-Os dados sao coletados do controller e MESCLADOS num SQLite (unifi/db.py). Um
-MAC so e considerado disponivel (liberavel) apos > AVAILABLE_DAYS (35) dias sem
-logar -- regra a prova de ferias. Cada visita as telas grava uma coleta (no
-maximo a cada 120s); para historico continuo, rode collect.py periodicamente.
+Versao servidor/Docker. Os dados sao coletados do controller e MESCLADOS num
+PostgreSQL (unifi/db.py). Um MAC so e considerado disponivel (liberavel) apos
+> AVAILABLE_DAYS (35) dias sem logar -- regra a prova de ferias.
+
+Diferencas em relacao a versao desktop:
+  - Servido por gunicorn (`app:app`), nao por app.run/pywebview. O entrypoint
+    NAO e mais iniciar.py: o watchdog de heartbeat de la encerra o processo
+    apos 90s sem navegador, o que num container viraria restart loop.
+  - A coleta e responsabilidade do servico `collector`; o web so le. Ver
+    COLLECT_ON_OPEN.
+  - Comunicacao com a UniFi via CONTA DE SERVICO (unifi/config.py).
+  - Logs em stdout (padrao Docker/Portainer), nao em arquivo rotativo.
 """
 from __future__ import annotations
 
@@ -12,13 +20,12 @@ import io
 import logging
 import os
 import secrets
-import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
 import uuid
-from logging.handlers import TimedRotatingFileHandler
 
 from dotenv import load_dotenv
 from flask import (
@@ -26,92 +33,43 @@ from flask import (
     session, url_for,
 )
 
-from unifi import UnifiClient, UnifiError, db, secret
+from unifi import UnifiClient, UnifiError, db
 from unifi import config as unifi_config_mod
 from unifi.inventory import snapshot_all, collect_unifi_audit
 
-# Caminhos robustos para rodar tanto via "python app.py" quanto como .exe
-# (PyInstaller): templates/static saem do bundle (_MEIPASS), enquanto .env e o
-# banco ficam ao lado do executavel (graveis).
-FROZEN = getattr(sys, "frozen", False)
-APP_DIR = (os.path.dirname(sys.executable) if FROZEN
-           else os.path.dirname(os.path.abspath(__file__)))
-
-
-def resource_path(rel: str) -> str:
-    base = getattr(sys, "_MEIPASS", APP_DIR)
-    return os.path.join(base, rel)
-
-
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(APP_DIR, ".env"))
 
 app = Flask(__name__,
-            template_folder=resource_path("templates"),
-            static_folder=resource_path("static"))
+            template_folder=os.path.join(APP_DIR, "templates"),
+            static_folder=os.path.join(APP_DIR, "static"))
 
-APP_VERSION = "v4"
+APP_VERSION = os.getenv("APP_VERSION", "v5-docker")
 DEFAULT_DAYS = db.AVAILABLE_DAYS  # 35
 NEVER_MODE = os.getenv("NEVER_MODE", "grace")  # grace | immediate
 EDIT_LOCK_TTL = 180  # segundos: aviso de edicao simultanea
 COLLECT_BASE = int(os.getenv("COLLECT_BASE", "60"))   # base da janela de coleta
 SESSION_TTL = 90        # segundos sem ping -> sessao considerada encerrada
 
-# ---------------------------------------------------------------- logs/
-LOG_DIR = os.path.join(APP_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+# Pasta gravavel (volume). Guarda os backups CSV/dump gerados pela tela Backup.
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+BACKUP_DIR = os.getenv("BACKUP_DIR", os.path.join(DATA_DIR, "backups"))
+
+# ---------------------------------------------------------------- logging
+# Em container os logs vao para stdout: o Docker/Portainer coleta, rotaciona e
+# exibe. Escrever em arquivo dentro do container so perderia o log no restart.
+logging.basicConfig(
+    stream=sys.stdout,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 log = logging.getLogger("gestaomac")
-if not log.handlers:
-    log.setLevel(logging.INFO)
-    _h = TimedRotatingFileHandler(
-        os.path.join(LOG_DIR, "gestaomac.log"), when="midnight",
-        backupCount=60, encoding="utf-8")
-    _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    log.addHandler(_h)
 
-# Ponteiro local (ao lado do exe) que guarda ONDE fica o banco. Assim o usuario
-# aponta a pasta de rede no proprio login, sem mexer no .env.
-DBPOINTER = os.path.join(APP_DIR, "dbpath.cfg")
-
-
-def _read_pointer():
-    try:
-        if os.path.exists(DBPOINTER):
-            return (open(DBPOINTER, encoding="utf-8").read().strip() or None)
-    except Exception:
-        pass
-    return None
-
-
-DB_PATH = (os.getenv("DB_PATH") or _read_pointer()
-           or os.path.join(APP_DIR, "data", "history.db"))
-DATA_DIR = os.path.dirname(DB_PATH)
-
-# A chave de cripto fica NA RAIZ (ao lado do exe) por padrao -- a MESMA chave
-# deve ser distribuida para cada PC que usa o banco compartilhado. Migra a
-# chave antiga (que ficava na pasta do banco) se existir e a da raiz nao.
-KEY_PATH = os.getenv("KEY_PATH") or os.path.join(APP_DIR, "secret.key")
-# Credenciais do UniFi: arquivo LOCAL por maquina (cada usuario sua conta).
-CREDS_PATH = os.getenv("CREDS_PATH") or os.path.join(APP_DIR, "creds.enc")
-
-
-def set_db_folder(folder: str) -> None:
-    """Aponta o banco para uma PASTA (ex.: de rede). Persiste em dbpath.cfg.
-    A secret.key NAO muda -- continua na raiz (mesma chave em todos os PCs)."""
-    global DB_PATH, DATA_DIR
-    folder = (folder or "").strip().rstrip("/\\")
-    if not folder:
-        return
-    DB_PATH = os.path.join(folder, "history.db")
-    DATA_DIR = folder
-    os.makedirs(folder, exist_ok=True)
-    with open(DBPOINTER, "w", encoding="utf-8") as fh:
-        fh.write(DB_PATH)
-
-# Multiusuario: instancias "visualizador" nao coletam (evita disputa de escrita
-# no banco em rede). Deixe um coletor central (collect.py agendado) gravando.
-# Defina COLLECT_ON_OPEN=0 nos PCs dos usuarios; =1 no coletor (ou uso single).
-COLLECT_ON_OPEN = os.getenv("COLLECT_ON_OPEN", "1").strip().lower() \
-    not in {"0", "false", "no", "off", "nao", "não"}
+# Coleta na requisicao: DESLIGADA por padrao no servidor. Quem coleta e o
+# servico `collector`. Ligar isto faz cada visita de tela disputar o lease e
+# chamar o controller, deixando a navegacao lenta sem necessidade.
+COLLECT_ON_OPEN = os.getenv("COLLECT_ON_OPEN", "0").strip().lower() \
+    in {"1", "true", "yes", "on", "sim"}
 
 # Unidades disponiveis no checklist do cadastro (editavel via env UNITS).
 UNITS = [u.strip() for u in os.getenv(
@@ -120,45 +78,53 @@ UNITS = [u.strip() for u in os.getenv(
 
 _client: UnifiClient | None = None
 _client_sig = None
+# Serializa o uso do UnifiClient compartilhado DENTRO deste processo: o codigo
+# muda `client.site` antes de cada chamada, o que e estado mutavel comum.
+# A exclusao entre PROCESSOS/CONTAINERES e feita por db.acquire_wlan_lock.
 _lock = threading.Lock()
 _sites_cache: tuple[float, list[dict]] | None = None
 
 
-def db_conn():
-    return db.connect(DB_PATH)
-
-
 def _flask_secret() -> str:
-    """Segredo de sessao persistente (gerado uma vez e guardado no banco)."""
-    conn = db_conn()
-    try:
-        s = db.get_setting(conn, "flask_secret")
-        if not s:
-            s = secrets.token_hex(32)
-            db.set_setting(conn, "flask_secret", s)
-        return s
-    finally:
-        conn.close()
+    """Segredo de sessao persistente: fica no banco, entao todas as replicas
+    compartilham e as sessoes sobrevivem a restart/redeploy."""
+    override = os.getenv("FLASK_SECRET_KEY")
+    if override:
+        return override
+    with db.connection() as conn:
+        return db.get_or_create_setting(
+            conn, "flask_secret", lambda: secrets.token_hex(32))
 
 
-app.secret_key = _flask_secret()
+def bootstrap() -> None:
+    """Espera o banco, aplica o schema e resolve o segredo de sessao."""
+    db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "60")))
+    if os.getenv("APPLY_SCHEMA", "1").lower() in {"1", "true", "yes", "on"}:
+        db.apply_schema()
+    app.secret_key = _flask_secret()
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    log.info("UniFi: %s", unifi_config_mod.describe())
+    log.info("coleta na requisicao (COLLECT_ON_OPEN): %s",
+             "ligada" if COLLECT_ON_OPEN else "desligada")
 
 
 # ----------------------------------------------------- credenciais UniFi
 def get_unifi_config() -> dict | None:
-    return unifi_config_mod.resolve(CREDS_PATH, KEY_PATH)
+    return unifi_config_mod.resolve()
 
 
 def unifi_configured() -> bool:
-    c = get_unifi_config()
-    return bool(c and c["host"] and c["username"] and c["password"])
+    return unifi_config_mod.is_configured()
 
 
 def get_client() -> UnifiClient:
+    """Cliente UniFi da CONTA DE SERVICO (compartilhado no processo)."""
     global _client, _client_sig
     cfg = get_unifi_config()
     if not cfg or not cfg["username"] or not cfg["password"]:
-        raise UnifiError("UniFi nao configurado. Acesse Configuracao.")
+        raise UnifiError(
+            "Conta de servico do UniFi nao configurada. Defina UNIFI_HOST, "
+            "UNIFI_SERVICE_USERNAME e UNIFI_SERVICE_PASSWORD no stack.")
     sig = (cfg["host"], cfg["site"], cfg["username"], cfg["password"], cfg["verify"])
     if _client is None or _client_sig != sig:
         _client = UnifiClient(host=cfg["host"], username=cfg["username"],
@@ -195,80 +161,54 @@ def site_desc(site_id: str) -> str:
 
 
 def _machine() -> str:
+    """Identifica a instancia. Em container e o id curto do container."""
     try:
-        return socket.gethostname()
+        return os.getenv("INSTANCE_NAME") or socket.gethostname()
     except Exception:
         return "?"
 
 
 def maybe_collect(force: bool = False) -> bool:
-    """Coleta distribuida com LEASE (turno unico): so UM terminal coleta por
-    janela; os demais apenas re-leem. Janela = COLLECT_BASE + 30s x conectados.
-    force (abrir/fechar/botao) usa janela curta de 15s (evita estouro)."""
+    """Coleta com LEASE (turno unico): so UMA instancia coleta por janela.
+    Janela = COLLECT_BASE + 30s x conectados. force usa janela curta de 15s."""
     if not force and not COLLECT_ON_OPEN:
-        return False  # instancia marcada como somente-visualizacao
-    conn = db_conn()
-    try:
+        return False
+    with db.connection() as conn:
         if force:
             interval = 15
         else:
             interval = COLLECT_BASE + 30 * db.active_count(conn, SESSION_TTL)
         if not db.claim_collection(conn, interval, _machine()):
-            return False  # outro terminal ja coletou nesta janela
-    finally:
-        conn.close()
+            return False  # outra instancia ja coletou nesta janela
 
     with _lock:
         try:
             cli = get_client()
             rows, ts = snapshot_all(cli)
             novos = 0
-            conn = db_conn()
-            try:
+            with db.connection() as conn:
                 db.record_snapshot(conn, rows, ts)
                 try:
                     novos = collect_unifi_audit(cli, conn, get_sites())
                 except Exception as exc:
                     log.warning("espelho log UniFi falhou: %s", exc)
-            finally:
-                conn.close()
             log.info("coleta: %d linhas | %d eventos UniFi novos | por %s",
                      len(rows), novos, _machine())
         except Exception as exc:
             log.error("coleta falhou: %s", exc)
+            invalidate_client()   # sessao pode ter expirado: forca novo login
             return False
     return True
 
 
 # ----------------------------------------------- presenca / heartbeat
-_LAST_PING = {"t": time.time()}
-_PINGED = {"v": False}
-
-
-def seconds_since_ping() -> float:
-    return time.time() - _LAST_PING["t"]
-
-
-def was_pinged() -> bool:
-    return _PINGED["v"]
-
-
-def final_shutdown_collect() -> None:
-    """Coleta final ao fechar (best-effort)."""
-    try:
-        log.info("encerrando: coleta final")
-        maybe_collect(force=True)
-    except Exception:
-        pass
-
-
 @app.context_processor
 def _inject_logos():
     """Disponibiliza a logo da empresa (se o arquivo existir) e a marca/versao."""
     brand_logo = None
     for name in ("logo_brand.png", "logo_brand.jpg", "logo_brand.jpeg",
                  "logo_brand.webp"):
-        if os.path.exists(resource_path(os.path.join("static", name))):
+        if os.path.exists(os.path.join(app.static_folder, name)):
             brand_logo = name
             break
     return {"brand_logo": brand_logo, "app_version": APP_VERSION,
@@ -281,48 +221,48 @@ def _inject_alerts():
     if not session.get("user"):
         return {"vip_alert": [], "connected": 0}
     try:
-        conn = db_conn()
-        try:
+        with db.connection() as conn:
             return {"vip_alert": db.vip_alerts(conn),
                     "connected": db.active_count(conn, SESSION_TTL)}
-        finally:
-            conn.close()
     except Exception:
         return {"vip_alert": [], "connected": 0}
 
 
+@app.route("/healthz")
+def healthz():
+    """Healthcheck do container: valida que o banco responde."""
+    try:
+        with db.connection() as conn:
+            conn.execute("SELECT 1")
+        return {"ok": True, "version": APP_VERSION}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}, 503
+
+
 @app.route("/api/ping", methods=["GET", "POST"])
 def api_ping():
-    _LAST_PING["t"] = time.time()
-    _PINGED["v"] = True
     connected = 1
     sid = session.get("sid")
     if sid:
-        conn = db_conn()
-        try:
+        with db.connection() as conn:
             db.ping_session(conn, sid, session.get("user", ""), _machine())
             connected = db.active_count(conn, SESSION_TTL)
-        finally:
-            conn.close()
     return {"connected": connected, "ts": int(time.time())}
 
 
 @app.route("/api/close", methods=["GET", "POST"])
 def api_close():
-    # Apenas encerra a sessao de presenca. NAO derruba o app -- o encerramento
-    # acontece por ausencia de heartbeat (o navegador parou de pingar de verdade).
+    # Encerra apenas a sessao de presenca. Ao contrario do desktop, nao existe
+    # watchdog: o processo do servidor nunca se encerra por falta de heartbeat.
     sid = session.get("sid")
     if sid:
-        conn = db_conn()
-        try:
+        with db.connection() as conn:
             db.end_session(conn, sid)
-        finally:
-            conn.close()
     return {"ok": True}
 
 
 # --------------------------------------------------------------------- rotas
-PUBLIC_ENDPOINTS = {"login", "static", "api_ping", "api_close"}
+PUBLIC_ENDPOINTS = {"login", "static", "api_ping", "api_close", "healthz"}
 
 
 @app.before_request
@@ -336,89 +276,74 @@ def _guard():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    # Permite apontar a PASTA do banco (rede) no proprio login.
-    if request.method == "POST" and request.form.get("db_folder", "").strip():
-        set_db_folder(request.form["db_folder"].strip())
-        invalidate_client()
+    """Acesso validado contra o controller com a conta PESSOAL do usuario.
 
-    # Acesso = credenciais do UniFi (validadas direto no controller).
-    conn = db_conn()
-    try:
-        host = db.get_setting(conn, "unifi_host", "") or os.getenv("UNIFI_HOST", "")
-        site = db.get_setting(conn, "unifi_site", "default")
-        verify = db.get_setting(conn, "unifi_verify", "0") == "1"
-        user_saved = db.get_setting(conn, "unifi_username", "")
-    finally:
-        conn.close()
+    A senha digitada e usada apenas para essa validacao e descartada em
+    seguida -- nao vai para o banco nem para disco. Quem fala com a UniFi
+    depois e a conta de servico.
+    """
+    cfg = get_unifi_config() or {}
+    host = cfg.get("host", "")
+    user_saved = ""
 
     if request.method == "POST":
-        host = (request.form.get("host", "").strip() or host)
         user = request.form.get("username", "").strip()
         pw = request.form.get("password", "")
+        if not host:
+            flash("UNIFI_HOST nao configurado no servidor. Avise a TI.", "err")
+            return render_template("login.html", host=host, user_saved=user,
+                                   db_folder=None)
         try:
             test = UnifiClient(host=host, username=user, password=pw,
-                               site=site, verify_ssl=verify)
+                               site=cfg.get("site", "default"),
+                               verify_ssl=cfg.get("verify", False))
             test.login()                 # valida no controller UniFi
             test.get_sites()             # garante que tem acesso de leitura
-            # Cada usuario usa a PROPRIA conta UniFi: grava as credenciais
-            # LOCALMENTE nesta maquina (criptografadas com a secret.key local).
-            unifi_config_mod.save(CREDS_PATH, KEY_PATH, {
-                "host": host, "site": site, "username": user,
-                "password": pw, "verify": verify})
-            invalidate_client()
+            try:
+                test.logout()
+            except Exception:
+                pass
             session["user"] = user
             session["sid"] = uuid.uuid4().hex
-            conn = db_conn()
-            try:
+            with db.connection() as conn:
                 db.ping_session(conn, session["sid"], user, _machine())
-            finally:
-                conn.close()
-            log.info("login: %s de %s", user, _machine())
+            log.info("login: %s em %s", user, _machine())
             return redirect(request.args.get("next") or url_for("overview"))
         except Exception:
-            flash("Login recusado pelo UniFi: verifique usuário, senha e host.", "err")
+            flash("Login recusado pelo UniFi: verifique usuário e senha.", "err")
             user_saved = user
     return render_template("login.html", host=host, user_saved=user_saved,
-                           db_folder=DATA_DIR)
+                           db_folder=None)
 
 
 @app.route("/logout")
 def logout():
     sid = session.get("sid")
     if sid:
-        conn = db_conn()
-        try:
+        with db.connection() as conn:
             db.end_session(conn, sid)
-        finally:
-            conn.close()
     session.clear()
     flash("Sessão encerrada.", "ok")
     return redirect(url_for("login"))
 
 
-@app.route("/config", methods=["GET", "POST"])
+@app.route("/config")
 def config():
-    if request.method == "POST":
-        cur = get_unifi_config() or {}
-        pw = request.form.get("password", "")
-        cfg = {
-            "host": request.form.get("host", "").strip(),
-            "site": request.form.get("site", "").strip() or "default",
-            "username": request.form.get("username", "").strip(),
-            "verify": request.form.get("verify") == "on",
-            # mantem a senha atual se o campo vier vazio
-            "password": pw or cur.get("password", ""),
-        }
-        unifi_config_mod.save(CREDS_PATH, KEY_PATH, cfg)
-        invalidate_client()
-        try:
-            n = len(get_client().get_sites())
-            flash(f"Configuração salva e conectada: {n} site(s) encontrados.", "ok")
-        except Exception as exc:
-            flash(f"Salvo, mas não consegui conectar: {str(exc)[:140]}", "err")
-        return redirect(url_for("config"))
+    """Somente leitura: a configuracao agora vem do ambiente (stack/secrets).
+
+    Na versao desktop esta tela gravava host/usuario/senha. Num servidor
+    compartilhado isso permitiria a qualquer usuario logado trocar a conta de
+    servico de todo mundo, entao virou exibicao do estado atual.
+    """
     cfg = get_unifi_config() or {}
-    return render_template("config.html", cfg=cfg, has_pw=bool(cfg.get("password")))
+    status, detail = "ok", ""
+    try:
+        detail = f"{len(get_sites())} site(s) acessiveis."
+    except Exception as exc:
+        status, detail = "err", str(exc)[:200]
+    return render_template("config.html", cfg=cfg, has_pw=bool(cfg.get("password")),
+                           readonly=True, status=status, detail=detail,
+                           resumo=unifi_config_mod.describe())
 
 
 @app.route("/")
@@ -430,21 +355,17 @@ def index():
 def overview():
     days = int(request.args.get("days", DEFAULT_DAYS))
     maybe_collect(force=request.args.get("refresh") == "1")
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         data = db.overview_summary(conn, days=days, never_mode=NEVER_MODE)
-    finally:
-        conn.close()
     return render_template("overview.html", data=data, days=days, sites=get_sites())
 
 
 @app.route("/site/<site_id>")
 def dashboard(site_id):
     days = int(request.args.get("days", DEFAULT_DAYS))
-    filt = request.args.get("filter", "all")  # all | unused | online
+    filt = request.args.get("filter", "all")  # all | unused | online | blocked | d50 | d100
     maybe_collect()
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         mobiles = db.site_wlans(conn, site_id)
         if not mobiles:
             return render_template(
@@ -454,8 +375,6 @@ def dashboard(site_id):
         chosen = next((w for w in mobiles if w["_id"] == wlan_id), mobiles[0])
         inv = db.site_inventory(conn, site_id, wlan_id, days=days,
                                 never_mode=NEVER_MODE)
-    finally:
-        conn.close()
 
     rows = inv["rows"]
     if filt == "unused":
@@ -480,21 +399,21 @@ def dashboard(site_id):
 @app.route("/refresh")
 def refresh():
     """Botao 'Atualizar status': forca uma coleta (somente leitura) e volta."""
-    maybe_collect(force=True)
-    flash("Status atualizado: dados coletados do controller (somente leitura).", "ok")
+    if maybe_collect(force=True):
+        flash("Status atualizado: dados coletados do controller.", "ok")
+    else:
+        flash("Uma coleta recente ja estava em andamento; dados na tela são "
+              "os mais atuais.", "warn")
     return redirect(request.args.get("next") or url_for("overview"))
 
 
 @app.route("/backup.csv")
 def backup_csv():
     """Backup completo (CSV) de TODOS os aparelhos ja vistos na mobile + cadastro.
-    Tambem salva uma copia em backups/ ao lado do app."""
+    Tambem salva uma copia no volume de dados."""
     maybe_collect()
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         rows = db.backup_rows(conn)
-    finally:
-        conn.close()
 
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
@@ -507,29 +426,21 @@ def backup_csv():
         w.writerow([r.get(k, "") for k in header])
     data = buf.getvalue().encode("utf-8-sig")
 
-    # salva uma copia em disco (backup historico)
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    bkp_dir = os.path.join(APP_DIR, "backups")
-    os.makedirs(bkp_dir, exist_ok=True)
-    with open(os.path.join(bkp_dir, f"backup_mobile_{stamp}.csv"), "wb") as fh:
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    with open(os.path.join(BACKUP_DIR, f"backup_mobile_{stamp}.csv"), "wb") as fh:
         fh.write(data)
 
     return Response(data, mimetype="text/csv", headers={
         "Content-Disposition": f'attachment; filename="backup_mobile_{stamp}.csv"'})
 
 
-def _bkp_dir() -> str:
-    d = os.path.join(APP_DIR, "backups")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
 @app.route("/backup")
 def backup_page():
-    d = _bkp_dir()
+    os.makedirs(BACKUP_DIR, exist_ok=True)
     files = []
-    for f in sorted(os.listdir(d), reverse=True):
-        p = os.path.join(d, f)
+    for f in sorted(os.listdir(BACKUP_DIR), reverse=True):
+        p = os.path.join(BACKUP_DIR, f)
         if os.path.isfile(p):
             files.append({"name": f, "kb": round(os.path.getsize(p) / 1024, 1),
                           "mtime": os.path.getmtime(p)})
@@ -538,49 +449,55 @@ def backup_page():
 
 @app.route("/backup.db")
 def backup_db():
-    """Baixa o banco SQLite inteiro (cópia consistente via backup online) e
-    guarda uma cópia em backups/."""
-    import sqlite3
+    """Dump completo do banco.
+
+    Na versao SQLite isto usava sqlite3.Connection.backup para copiar o arquivo.
+    Com PostgreSQL o equivalente e o pg_dump em formato custom (-Fc), que ja sai
+    comprimido e e restauravel com pg_restore.
+    """
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out_path = os.path.join(_bkp_dir(), f"history_{stamp}.db")
-    src = db.connect(DB_PATH)
+    fname = f"gestaomac_{stamp}.dump"
+    out_path = os.path.join(BACKUP_DIR, fname)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+
+    env = dict(os.environ)
+    env.setdefault("PGPASSWORD", os.getenv("PGPASSWORD", ""))
+    cmd = ["pg_dump", "--format=custom", "--no-owner", "--no-acl",
+           "--file", out_path, db.dsn_from_env()]
     try:
-        dst = sqlite3.connect(out_path)
-        try:
-            with dst:
-                src.backup(dst)
-        finally:
-            dst.close()
-    finally:
-        src.close()
-    return send_file(out_path, as_attachment=True,
-                     download_name=f"history_{stamp}.db")
+        res = subprocess.run(cmd, env=env, capture_output=True, timeout=600)
+    except FileNotFoundError:
+        log.error("pg_dump ausente na imagem")
+        flash("pg_dump não está disponível no servidor. Avise a TI.", "err")
+        return redirect(url_for("backup_page"))
+    except subprocess.TimeoutExpired:
+        flash("Backup demorou demais e foi cancelado.", "err")
+        return redirect(url_for("backup_page"))
+    if res.returncode != 0:
+        err = (res.stderr or b"").decode("utf-8", "replace")[:300]
+        log.error("pg_dump falhou: %s", err)
+        flash(f"Falha ao gerar o backup: {err}", "err")
+        return redirect(url_for("backup_page"))
+
+    log.info("backup do banco gerado por %s: %s", session.get("user", ""), fname)
+    return send_file(out_path, as_attachment=True, download_name=fname)
 
 
 def _mobile_sites():
     """Sites com WLAN mobile + ocupacao (para os modulos add/remover)."""
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         return [s for s in db.overview_summary(
             conn, days=DEFAULT_DAYS, never_mode=NEVER_MODE)["sites"] if s["wlan_id"]]
-    finally:
-        conn.close()
 
 
 def _wlan_lock(key) -> bool:
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         return db.acquire_wlan_lock(conn, key, session.get("user", ""))
-    finally:
-        conn.close()
 
 
 def _wlan_unlock(key) -> None:
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         db.release_wlan_lock(conn, key)
-    finally:
-        conn.close()
 
 
 _BUSY_MSG = "Este site está sendo editado por outra pessoa agora. Tente em alguns segundos."
@@ -612,14 +529,11 @@ def adicionar():
         finally:
             _wlan_unlock(key)
         if res["changed"]:
-            conn = db_conn()
-            try:
+            with db.connection() as conn:
                 if nome:
                     db.upsert_client_info(conn, norm, {"nome": nome})
                 db.add_event(conn, int(time.time()), sid, site_desc(sid), norm,
                              "add_manual", f"por {session.get('user','')}")
-            finally:
-                conn.close()
             log.info("add_manual: %s em %s por %s", norm, sid, session.get("user", ""))
             maybe_collect(force=True)
             flash(f"MAC {norm} adicionado em {site_desc(sid)} ({res['count']}/512).", "ok")
@@ -645,11 +559,8 @@ def remover():
         except UnifiError as exc:
             flash(str(exc), "err")
             return render_template("remover.html", sites=_mobile_sites(), mac=mac)
-        conn = db_conn()
-        try:
+        with db.connection() as conn:
             ci = db.get_client_info(conn, norm) or {}
-        finally:
-            conn.close()
         if ci.get("vip"):
             flash(f"MAC {norm} é VIP/Diretoria — desmarque o VIP na ficha antes de remover.", "err")
             return render_template("remover.html", sites=_mobile_sites(), mac=mac)
@@ -670,12 +581,9 @@ def remover():
         finally:
             _wlan_unlock(key)
         if res["changed"]:
-            conn = db_conn()
-            try:
+            with db.connection() as conn:
                 db.add_event(conn, int(time.time()), sid, site_desc(sid), norm,
                              "remove_manual", f"por {session.get('user','')}")
-            finally:
-                conn.close()
             log.info("remove_manual: %s de %s por %s", norm, sid, session.get("user", ""))
             maybe_collect(force=True)
             flash(f"MAC {norm} removido de {site_desc(sid)} ({res['count']}/512).", "ok")
@@ -688,12 +596,9 @@ def remover():
 @app.route("/site/<site_id>/wlan/<wlan_id>/export.csv")
 def export_csv(site_id, wlan_id):
     maybe_collect()
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         inv = db.site_inventory(conn, site_id, wlan_id, days=DEFAULT_DAYS,
                                 never_mode=NEVER_MODE)
-    finally:
-        conn.close()
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
     w.writerow(["site", "wlan", "mac", "nome", "fabricante", "online",
@@ -729,13 +634,10 @@ def clientes():
     unidade = request.args.get("unidade", "").strip()
     only_vip = request.args.get("vip", "") == "1"
     maybe_collect()
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         rows = db.list_clients(conn, status="active", search=q or None)
         removed_count = db.removed_macs_with_info(conn)
         ev_ts = db.last_event_ts(conn)
-    finally:
-        conn.close()
     rows = _by_unidade(rows, unidade)
     if only_vip:
         rows = [r for r in rows if r.get("vip")]
@@ -752,12 +654,9 @@ def clientes_removidos():
     q = request.args.get("q", "").strip()
     unidade = request.args.get("unidade", "").strip()
     only_vip = request.args.get("vip", "") == "1"
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         rows = db.list_clients(conn, status="removed", search=q or None)
         ev_ts = db.last_event_ts(conn)
-    finally:
-        conn.close()
     rows = _by_unidade(rows, unidade)
     if only_vip:
         rows = [r for r in rows if r.get("vip")]
@@ -771,8 +670,7 @@ def clientes_removidos():
 
 @app.route("/cliente/<mac>", methods=["GET", "POST"])
 def cliente(mac):
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         if request.method == "POST":
             action = request.form.get("action", "save")
             if action == "copy" and request.form.get("from_mac"):
@@ -840,8 +738,6 @@ def cliente(mac):
         if lock and lock["who"] != me and (now - (lock["ts"] or 0) < EDIT_LOCK_TTL):
             editing_by = lock["who"]
         db.set_lock(conn, mac, me, now)   # registra/renova minha edicao
-    finally:
-        conn.close()
     selected_units = {x.strip() for x in
                       (info.get("unidade") or "").replace(";", ",").split(",")
                       if x.strip()}
@@ -858,16 +754,13 @@ def auditoria():
     event = request.args.get("event", "").strip()
     q = request.args.get("q", "").strip()
     fonte = request.args.get("fonte", "sistema")  # sistema | unifi
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         if fonte == "unifi":
             rows = db.list_unifi_audit(conn, search=q or None, limit=500)
             total = db.unifi_audit_count(conn)
         else:
             rows = db.recent_events(conn, event=event or None, search=q or None, limit=500)
             total = db.events_count(conn)
-    finally:
-        conn.close()
     return render_template("auditoria.html", rows=rows, event=event, q=q, fonte=fonte,
                            total=total, labels=db.EVENT_LABEL, sites=get_sites())
 
@@ -876,12 +769,9 @@ def auditoria():
 def auditoria_csv():
     event = request.args.get("event", "").strip()
     q = request.args.get("q", "").strip()
-    conn = db_conn()
-    try:
+    with db.connection() as conn:
         rows = db.recent_events(conn, event=event or None, search=q or None,
                                 limit=100000)
-    finally:
-        conn.close()
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
     w.writerow(["data_hora", "evento", "site", "mac", "detalhe"])
@@ -901,5 +791,10 @@ def _ts(value):
     return time.strftime("%d/%m/%Y %H:%M", time.localtime(value))
 
 
+# Executado tanto sob gunicorn (import do modulo) quanto em `python app.py`.
+bootstrap()
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")),
+            debug=os.getenv("FLASK_DEBUG", "0") == "1")

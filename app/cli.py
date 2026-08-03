@@ -11,30 +11,24 @@ Exemplos:
 from __future__ import annotations
 
 import argparse
-import io
-import os
 import sys
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 from dotenv import load_dotenv
 
 from unifi import UnifiClient, UnifiError
+from unifi import config as unifi_config_mod
 
 
 def build_client() -> UnifiClient:
+    """Usa a conta de servico (mesmas variaveis do app e do collector)."""
     load_dotenv()
-    try:
-        host = os.environ["UNIFI_HOST"]
-        username = os.environ["UNIFI_USERNAME"]
-        password = os.environ["UNIFI_PASSWORD"]
-    except KeyError as exc:
-        sys.exit(f"Variavel de ambiente ausente: {exc}. Copie .env.example para .env.")
+    cfg = unifi_config_mod.resolve()
+    if not cfg or not cfg["username"] or not cfg["password"]:
+        sys.exit("Conta de servico do UniFi nao configurada: defina UNIFI_HOST, "
+                 "UNIFI_SERVICE_USERNAME e UNIFI_SERVICE_PASSWORD.")
     return UnifiClient(
-        host=host, username=username, password=password,
-        site=os.getenv("UNIFI_SITE", "default"),
-        verify_ssl=os.getenv("UNIFI_VERIFY_SSL", "false").lower()
-        in {"1", "true", "yes", "on", "sim"},
+        host=cfg["host"], username=cfg["username"], password=cfg["password"],
+        site=cfg["site"], verify_ssl=cfg["verify"],
     )
 
 
