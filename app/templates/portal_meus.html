@@ -14,7 +14,7 @@
 </div>
 
 <textarea id="codigos" class="codigos" rows="{{ [vouchers|length, 10]|min }}"
-          readonly>{{ vouchers|map(attribute='code')|join('\n') }}</textarea>
+          readonly>{{ vouchers|map(attribute='code')|map('voucher')|join('\n') }}</textarea>
 <p class="muted" id="msgcopia" style="min-height:18px"></p>
 
 <table>
@@ -24,7 +24,7 @@
   <tbody>
     {% for v in vouchers %}
     <tr>
-      <td class="mono" style="font-size:17px"><b>{{ v.code }}</b></td>
+      <td class="mono" style="font-size:17px"><b>{{ v.code|voucher }}</b></td>
       <td class="muted">{{ v.site_desc or '—' }}</td>
       <td>{{ v.note or '—' }}</td>
       <td>{% if v.quota == 1 %}Uso único{% elif v.quota == 0 %}Ilimitado{% else %}{{ v.quota }} usos{% endif %}</td>

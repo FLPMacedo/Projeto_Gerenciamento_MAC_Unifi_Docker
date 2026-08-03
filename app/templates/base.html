@@ -27,8 +27,8 @@
       <a href="{{ url_for('config') }}" title="Configurar UniFi">⚙</a>
       <a href="{{ url_for('logout') }}" title="Sair">⏻ Sair</a>
     </nav>
-    {% if brand_logo %}
-    <img class="logo logo-brand" src="{{ url_for('static', filename=brand_logo) }}" alt="logo">
+    {% if brand_logo_url %}
+    <img class="logo logo-brand" src="{{ brand_logo_url }}" alt="logo">
     {% endif %}
   </header>
   <div class="readonly">🔒 Monitoramento + ações manuais <b>unitárias</b> (1 MAC por vez), com confirmação e registro de quem fez. Sem alterações em massa.</div>

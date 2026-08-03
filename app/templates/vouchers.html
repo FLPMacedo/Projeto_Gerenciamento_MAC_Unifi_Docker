@@ -40,7 +40,7 @@
   <tbody>
     {% for r in rows %}
     <tr {% if r.revogado_em %}class="off"{% endif %}>
-      <td class="mono"><b>{{ r.code }}</b></td>
+      <td class="mono"><b>{{ r.code|voucher }}</b></td>
       <td class="muted">{{ r.site_desc or r.site_id }}</td>
       <td>{{ r.note or '—' }}</td>
       <td>

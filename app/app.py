@@ -19,6 +19,7 @@ import csv
 import io
 import logging
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -30,7 +31,7 @@ import uuid
 from dotenv import load_dotenv
 from flask import (
     Flask, Response, abort, flash, redirect, render_template, request,
-    send_file, session, url_for,
+    send_file, send_from_directory, session, url_for,
 )
 
 from unifi import UnifiClient, UnifiError, db, secret
@@ -233,16 +234,37 @@ def maybe_collect(force: bool = False) -> bool:
 
 
 # ----------------------------------------------- presenca / heartbeat
+_LOGO_NOMES = ("logo_brand.png", "logo_brand.jpg", "logo_brand.jpeg",
+               "logo_brand.webp")
+# Alternativa ao static/: a logo da empresa NAO e versionada (identidade da
+# empresa fica fora do repositorio publico), entao um build feito pelo Portainer
+# a partir do Git nao teria o arquivo. Basta deixa-la nesta pasta do volume de
+# dados que o app a encontra igual.
+BRAND_DIR = os.getenv("BRAND_DIR", os.path.join(DATA_DIR, "branding"))
+
+
+def _logo_empresa() -> str | None:
+    """URL da logo da empresa, do static/ ou do volume. None se nao houver."""
+    for nome in _LOGO_NOMES:
+        if os.path.exists(os.path.join(app.static_folder, nome)):
+            return url_for("static", filename=nome)
+    for nome in _LOGO_NOMES:
+        if os.path.exists(os.path.join(BRAND_DIR, nome)):
+            return url_for("branding", nome=nome)
+    return None
+
+
+@app.route("/branding/<nome>")
+def branding(nome):
+    if nome not in _LOGO_NOMES:
+        abort(404)
+    return send_from_directory(BRAND_DIR, nome, max_age=3600)
+
+
 @app.context_processor
 def _inject_logos():
-    """Disponibiliza a logo da empresa (se o arquivo existir) e a marca/versao."""
-    brand_logo = None
-    for name in ("logo_brand.png", "logo_brand.jpg", "logo_brand.jpeg",
-                 "logo_brand.webp"):
-        if os.path.exists(os.path.join(app.static_folder, name)):
-            brand_logo = name
-            break
-    return {"brand_logo": brand_logo, "app_version": APP_VERSION,
+    """Disponibiliza a logo da empresa (se houver) e a marca/versao."""
+    return {"brand_logo_url": _logo_empresa(), "app_version": APP_VERSION,
             "brand": os.getenv("BRAND", "")}
 
 
@@ -297,7 +319,7 @@ def api_close():
 # --------------------------------------------------------------------- rotas
 # Publicas em QUALQUER modo: servem arquivos estaticos e o healthcheck do
 # container, que precisa responder antes de existir sessao.
-SEMPRE_PUBLICOS = {"static", "healthz"}
+SEMPRE_PUBLICOS = {"static", "healthz", "branding"}
 # Publicas so no painel de gestao (dispensam sessao, mas nao o modo admin).
 PUBLIC_ENDPOINTS = {"login", "api_ping", "api_close"}
 
@@ -1083,7 +1105,7 @@ def vouchers_csv():
                 "gerado_em", "retirado_em", "revogado_em", "revogado_por"])
     for r in rows:
         w.writerow([
-            r["code"], r["site_desc"] or r["site_id"], r["note"] or "",
+            _voucher_fmt(r["code"]), r["site_desc"] or r["site_id"], r["note"] or "",
             _quota_label(r["quota"]), r["duration_min"] or "",
             r["data_limit_mb"] or "", r["down_kbps"] or "", r["up_kbps"] or "",
             r["portal_nome"] or r["portal_username"] or "",
@@ -1160,6 +1182,20 @@ def _ts(value):
     if not value:
         return "-"
     return time.strftime("%d/%m/%Y %H:%M", time.localtime(value))
+
+
+@app.template_filter("voucher")
+def _voucher_fmt(code):
+    """Formata o codigo como a UniFi exibe e imprime: 02341-26485.
+
+    A API guarda e devolve 10 digitos corridos; o hifen e so apresentacao. O
+    banco continua com o valor cru, para casar com o que vem do controller --
+    formatar na gravacao faria a comparacao por codigo falhar.
+    """
+    digitos = re.sub(r"\D", "", str(code or ""))
+    if len(digitos) == 10:
+        return f"{digitos[:5]}-{digitos[5:]}"
+    return code or ""
 
 
 if MODO_PORTAL:
