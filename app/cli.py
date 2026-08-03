@@ -11,24 +11,29 @@ Exemplos:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from dotenv import load_dotenv
 
-from unifi import UnifiClient, UnifiError
+from unifi import UnifiClient, UnifiError, db
 from unifi import config as unifi_config_mod
 
 
 def build_client() -> UnifiClient:
-    """Usa a conta de servico (mesmas variaveis do app e do collector)."""
+    """Usa as mesmas credenciais do coletor (conta de servico ou o login mais
+    recente gravado na interface web)."""
     load_dotenv()
-    cfg = unifi_config_mod.resolve()
-    if not cfg or not cfg["username"] or not cfg["password"]:
-        sys.exit("Conta de servico do UniFi nao configurada: defina UNIFI_HOST, "
-                 "UNIFI_SERVICE_USERNAME e UNIFI_SERVICE_PASSWORD.")
+    db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "60")))
+    with db.connection() as conn:
+        candidatos = unifi_config_mod.collector_candidates(conn)
+    if not candidatos:
+        sys.exit("Nenhuma credencial disponivel. Faca login na interface web "
+                 "uma vez, ou configure a conta de servico.")
+    c = candidatos[0]
     return UnifiClient(
-        host=cfg["host"], username=cfg["username"], password=cfg["password"],
-        site=cfg["site"], verify_ssl=cfg["verify"],
+        host=c["host"], username=c["username"], password=c["password"],
+        site=c["site"], verify_ssl=c["verify"],
     )
 
 

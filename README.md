@@ -50,27 +50,31 @@ Localmente é o mesmo: `cp .env.example .env`, preencher, `docker compose up -d`
 
 ## Credenciais: como funciona
 
-A versão desktop gravava a senha UniFi de **cada usuário** num `creds.enc` local
-da máquina. Num container único atendendo várias pessoas isso não funciona: só
-existe um arquivo, e o último login sobrescreveria a credencial de todos — a
-coleta passaria a rodar silenciosamente com a conta de quem entrou por último.
+**Tudo pela web. Nada obrigatório em arquivo ou variável de ambiente.**
 
-No servidor:
+- Cada pessoa entra com a **própria conta UniFi**, como na versão desktop. A
+  validação é ao vivo contra o controller: só quem tem acesso no UniFi entra.
+- A credencial fica **cifrada no banco** (Fernet) e serve para duas coisas:
+  1. as telas e as ações de escrita usarem a conta de **quem está logado** — no
+     log nativo da UniFi aparece o nome real de quem alterou, coisa que a versão
+     desktop não fazia (lá tudo saía com uma conta só);
+  2. a **coleta automática**, que roda a cada 10 minutos sem ninguém logado, ter
+     uma credencial válida.
+- O **endereço do controller** é pedido no primeiro acesso e depois se altera
+  pela tela de Configuração.
 
-- Uma **conta de serviço** dedicada (`UNIFI_SERVICE_*`) faz toda a comunicação
-  com o controller: coleta e as ações de add/remover/troca.
-- O **login de cada pessoa** continua sendo validado ao vivo contra o controller
-  com a conta pessoal dela. Só quem tem acesso no UniFi entra. **A senha do
-  usuário não é gravada em lugar nenhum.**
-- A **autoria continua rastreada**: os eventos em `events` registram o usuário
-  logado como autor de cada ação.
+O coletor usa a credencial que autenticou mais recentemente. Se ela deixar de
+valer (a pessoa trocou a senha), ele tenta as anteriores antes de desistir — e
+o que faz falta nesse caso é só alguém fazer login de novo.
 
-Em produção, prefira `UNIFI_SERVICE_PASSWORD_FILE` apontando para um Docker
-secret — assim a senha não aparece em `docker inspect` nem na tela de variáveis
-do stack.
+### Endurecimento opcional para produção
 
-A conta de serviço precisa de: leitura de sites/WLANs/clientes e permissão de
-editar a `mac_filter_list` das WLANs mobile.
+| Variável | Para quê |
+|---|---|
+| `UNIFI_SERVICE_USERNAME` / `_PASSWORD` | conta de serviço dedicada; a coleta passa a preferi-la e nunca para por troca de senha pessoal |
+| `CREDS_KEY` | chave de criptografia das senhas. Sem ela, a chave é gerada e guardada na tabela `settings` — prático, mas fica no mesmo banco do texto cifrado |
+
+Ambas aceitam o sufixo `_FILE` apontando para um Docker secret.
 
 ---
 
@@ -126,7 +130,8 @@ para preencher as variáveis do stack.
 | Servidor | `iniciar.py` + pywebview | gunicorn (`app:app`) |
 | Encerramento | watchdog matava o processo sem heartbeat | não existe — mataria o container |
 | Coleta | a cada page load, com lease | serviço `collector` dedicado |
-| Credenciais | `creds.enc` por máquina | conta de serviço via env/secret |
+| Credenciais | `creds.enc` por máquina | `user_creds` cifrado no banco, gravado no login |
+| Autor no log da UniFi | uma conta para todos | a conta real de quem fez a ação |
 | Logs | arquivo rotativo em `logs/` | stdout (Docker/Portainer) |
 | Backup do banco | `sqlite3.backup` | `pg_dump -Fc` |
 | Trava de escrita | `threading.Lock` (1 processo) | `wlan_locks` no banco (entre containers) |

@@ -97,6 +97,28 @@ CREATE TABLE IF NOT EXISTS settings(
     value TEXT
 );
 
+-- Credenciais por usuario (modelo hibrido).
+--
+-- Cada pessoa entra com a PROPRIA conta UniFi, como na versao desktop. A senha
+-- e guardada cifrada (Fernet) para dois fins:
+--   1) as telas e as acoes de escrita usarem a conta de quem esta logado, de
+--      modo que o log nativo da UniFi registre o nome real do autor;
+--   2) o coletor, que roda sem ninguem logado, ter uma credencial valida --
+--      ele usa a mais recente que funcionou.
+--
+-- last_ok guarda a ultima vez que a credencial autenticou de fato: e por ele
+-- que o coletor escolhe qual usar, preferindo a que comprovadamente funciona.
+CREATE TABLE IF NOT EXISTS user_creds(
+    username     TEXT PRIMARY KEY,
+    host         TEXT NOT NULL,
+    site         TEXT NOT NULL DEFAULT 'default',
+    verify       SMALLINT NOT NULL DEFAULT 0,
+    password_enc TEXT NOT NULL,
+    updated_at   BIGINT,
+    last_ok      BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_user_creds_ok ON user_creds(last_ok DESC);
+
 -- ------------------------------------------------------- estado efemero
 -- Estas tres tabelas expiram sozinhas por TTL (20s a 180s). Sao migradas por
 -- fidelidade, mas qualquer residuo se resolve em menos de 3 minutos.

@@ -1,48 +1,86 @@
 {% extends "base.html" %}
 {% block content %}
-<h1>Acesso ao UniFi</h1>
-
-<p class="muted">
-  Esta tela é <b>somente leitura</b>. Na versão desktop ela gravava host, usuário
-  e senha; num servidor compartilhado isso deixaria qualquer pessoa logada trocar
-  a conta usada por todo mundo. A configuração agora vem do <b>stack</b>
-  (variáveis de ambiente / secrets do Portainer) e só a TI altera.
-</p>
+<h1>Configuração do acesso ao UniFi</h1>
 
 <div class="flash {{ 'ok' if status == 'ok' else 'err' }}">
   {% if status == 'ok' %}Conectado ao controller. {{ detail }}
   {% else %}Não foi possível conectar: {{ detail }}{% endif %}
 </div>
 
-<table class="tbl" style="max-width:720px">
-  <tr><th style="width:220px">Controller (host)</th>
-      <td>{{ cfg.host or '—' }}</td></tr>
-  <tr><th>Site padrão</th>
-      <td>{{ cfg.site or 'default' }}</td></tr>
-  <tr><th>Conta de serviço</th>
-      <td>{{ cfg.username or '—' }}</td></tr>
-  <tr><th>Senha da conta</th>
-      <td>{{ 'configurada' if has_pw else 'AUSENTE — a coleta não vai funcionar' }}</td></tr>
-  <tr><th>Verificar certificado TLS</th>
-      <td>{{ 'sim' if cfg.verify else 'não (certificado autoassinado do Cloud Key)' }}</td></tr>
-</table>
+<h2 class="sec">Endereço do controller</h2>
+<p class="muted">Vale para todo mundo. A <b>senha não se define aqui</b> — cada
+pessoa entra com a própria conta na tela de login.</p>
 
-<h2 style="margin-top:24px">Como as credenciais funcionam</h2>
-<ul class="muted">
-  <li>A <b>conta de serviço</b> acima é quem fala com a UniFi: faz a coleta e
-      executa add/remover/troca.</li>
-  <li>O <b>seu login</b> é validado na hora contra o controller com a sua conta
-      pessoal. A sua senha não é gravada em lugar nenhum.</li>
-  <li>Toda ação de escrita continua registrada na
-      <a href="{{ url_for('auditoria') }}">auditoria</a> com o nome de quem pediu.</li>
-</ul>
+<form method="post" class="cadform">
+  <input type="hidden" name="acao" value="salvar">
+  <label>Endereço do controller (host)
+    <input name="host" value="{{ cfg.host or '' }}"
+           placeholder="https://IP-DO-CONTROLLER" required>
+  </label>
+  <label>Site padrão (id interno)
+    <input name="site" value="{{ cfg.site or 'default' }}" placeholder="default">
+  </label>
+  <label class="inline">
+    <input type="checkbox" name="verify" {{ 'checked' if cfg.verify }}>
+    Verificar certificado TLS (deixe desligado para o certificado autoassinado
+    do Cloud Key)
+  </label>
+  <button class="btn primary" type="submit">Salvar</button>
+</form>
 
-<h2 style="margin-top:24px">Para alterar</h2>
+<h2 class="sec" style="margin-top:26px">Credenciais guardadas</h2>
 <p class="muted">
-  No Portainer, edite as variáveis do stack e faça o redeploy:
-  <code>UNIFI_HOST</code>, <code>UNIFI_SITE</code>,
-  <code>UNIFI_SERVICE_USERNAME</code>, <code>UNIFI_SERVICE_PASSWORD</code>
-  (ou <code>UNIFI_SERVICE_PASSWORD_FILE</code> apontando para um secret),
-  <code>UNIFI_VERIFY_SSL</code>.
+  Gravadas automaticamente quando cada pessoa faz login, e usadas para duas
+  coisas: as ações de escrita saírem no log da UniFi com o <b>nome real</b> de
+  quem fez, e a <b>coleta automática</b> ter uma conta válida para trabalhar
+  quando ninguém está logado. As senhas ficam criptografadas.
 </p>
+
+{% if creds %}
+<table>
+  <thead>
+    <tr><th>Usuário</th><th>Site</th><th>Último acesso válido</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for c in creds %}
+    <tr>
+      <td>{{ c.username }}{% if c.username == me %} <span class="muted">(você)</span>{% endif %}
+        {% if loop.first %}<span class="badge">usada pela coleta</span>{% endif %}</td>
+      <td class="muted">{{ c.site }}</td>
+      <td class="muted">{{ c.last_ok|ts }}</td>
+      <td>
+        <form method="post" style="display:inline"
+              onsubmit="return confirm('Remover a credencial de {{ c.username }}?')">
+          <input type="hidden" name="acao" value="remover">
+          <input type="hidden" name="username" value="{{ c.username }}">
+          <button class="btn" type="submit">Remover</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted" style="font-size:12px">
+  Remover uma credencial não bloqueia ninguém: ela é regravada no próximo login
+  daquela pessoa.
+</p>
+{% else %}
+<p class="muted">Nenhuma credencial guardada ainda. A coleta automática começa
+assim que a primeira pessoa fizer login.</p>
+{% endif %}
+
+{% if tem_servico %}
+<p class="muted" style="margin-top:12px">
+  ✔ Há uma <b>conta de serviço</b> configurada no servidor. A coleta prefere
+  ela, então não para se alguém trocar a senha pessoal.
+</p>
+{% else %}
+<p class="muted" style="margin-top:12px">
+  ℹ️ Sem conta de serviço. A coleta usa a credencial do login mais recente que
+  funcionou — se essa pessoa trocar a senha, a coleta tenta as anteriores e,
+  não havendo nenhuma válida, para até alguém entrar de novo.
+</p>
+{% endif %}
+
+<p class="muted" style="font-size:12px;margin-top:18px">{{ resumo }}</p>
 {% endblock %}

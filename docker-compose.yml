@@ -56,12 +56,19 @@ services:
       TZ: ${TZ:-America/Sao_Paulo}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       APPLY_SCHEMA: "0"          # quem aplica e o proprio init_db.py
-      # ---- UniFi (conta de servico) ----
-      UNIFI_HOST: ${UNIFI_HOST}
+      # ---- UniFi ----
+      # Nada aqui e obrigatorio: o sistema se configura pela web (cada pessoa
+      # entra com a propria conta e o host e pedido no primeiro acesso).
+      # Estas duas sao apenas semente do primeiro arranque.
+      UNIFI_HOST: ${UNIFI_HOST:-}
       UNIFI_SITE: ${UNIFI_SITE:-default}
-      UNIFI_SERVICE_USERNAME: ${UNIFI_SERVICE_USERNAME}
-      UNIFI_SERVICE_PASSWORD: ${UNIFI_SERVICE_PASSWORD}
       UNIFI_VERIFY_SSL: ${UNIFI_VERIFY_SSL:-false}
+      # Conta de servico OPCIONAL: se preenchida, a coleta prefere ela e nao
+      # para caso alguem troque a senha pessoal.
+      UNIFI_SERVICE_USERNAME: ${UNIFI_SERVICE_USERNAME:-}
+      UNIFI_SERVICE_PASSWORD: ${UNIFI_SERVICE_PASSWORD:-}
+      # Chave de cripto das senhas. Vazio = gerada e guardada no banco.
+      CREDS_KEY: ${CREDS_KEY:-}
       # ---- aplicacao ----
       BRAND: ${BRAND:-}
       UNITS: ${UNITS:-101,102,103,104,105,106,107,110,111,113,115,117}

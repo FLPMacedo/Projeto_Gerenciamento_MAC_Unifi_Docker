@@ -459,6 +459,82 @@ def get_or_create_setting(conn, key, factory) -> str:
         "SELECT value FROM settings WHERE key=%s", (key,)).fetchone()["value"]
 
 
+# ================================================ credenciais por usuario
+# Modelo hibrido: cada pessoa entra com a propria conta UniFi (como no desktop).
+# As telas e as acoes de escrita usam a conta de quem esta logado -- assim o log
+# nativo da UniFi registra o autor real. O coletor, que roda sem ninguem logado,
+# usa a credencial mais recente que comprovadamente funcionou.
+def save_user_creds(conn, username, host, site, verify, password) -> None:
+    from . import secret
+    enc = secret.encrypt(conn, password)
+    now = int(time.time())
+    conn.execute(
+        "INSERT INTO user_creds(username, host, site, verify, password_enc, "
+        "updated_at, last_ok) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+        "ON CONFLICT(username) DO UPDATE SET host=excluded.host, "
+        "site=excluded.site, verify=excluded.verify, "
+        "password_enc=excluded.password_enc, updated_at=excluded.updated_at, "
+        "last_ok=excluded.last_ok",
+        (username, host, site or "default", 1 if verify else 0, enc, now, now))
+    conn.commit()
+
+
+def _creds_view(conn, r) -> dict | None:
+    from . import secret
+    pw = secret.decrypt(conn, r["password_enc"])
+    if not pw:
+        return None          # chave trocada ou dado corrompido: inutilizavel
+    return {"username": r["username"], "host": r["host"], "site": r["site"],
+            "verify": bool(r["verify"]), "password": pw,
+            "updated_at": r["updated_at"], "last_ok": r["last_ok"]}
+
+
+def get_user_creds(conn, username) -> dict | None:
+    r = conn.execute("SELECT * FROM user_creds WHERE username=%s",
+                     (username,)).fetchone()
+    return _creds_view(conn, r) if r else None
+
+
+def mark_creds_ok(conn, username) -> None:
+    conn.execute("UPDATE user_creds SET last_ok=%s WHERE username=%s",
+                 (int(time.time()), username))
+    conn.commit()
+
+
+def collector_creds(conn, limit: int = 5) -> list[dict]:
+    """Credenciais candidatas para o coletor, da mais confiavel para a menos.
+
+    Ordena por last_ok: a que autenticou mais recentemente vem primeiro. Devolve
+    varias porque a primeira pode ter deixado de valer (a pessoa trocou a senha
+    no dominio, a conta foi desativada) -- nesse caso o coletor tenta a proxima
+    em vez de simplesmente parar de coletar.
+    """
+    rows = conn.execute(
+        "SELECT * FROM user_creds ORDER BY last_ok DESC NULLS LAST, "
+        "updated_at DESC LIMIT %s", (limit,)).fetchall()
+    out = []
+    for r in rows:
+        c = _creds_view(conn, r)
+        if c:
+            out.append(c)
+    return out
+
+
+def list_user_creds(conn) -> list[dict]:
+    """Para a tela de configuracao. NUNCA devolve a senha."""
+    return [{"username": r["username"], "host": r["host"], "site": r["site"],
+             "verify": bool(r["verify"]), "updated_at": r["updated_at"],
+             "last_ok": r["last_ok"]}
+            for r in conn.execute(
+                "SELECT username, host, site, verify, updated_at, last_ok "
+                "FROM user_creds ORDER BY last_ok DESC NULLS LAST")]
+
+
+def delete_user_creds(conn, username) -> None:
+    conn.execute("DELETE FROM user_creds WHERE username=%s", (username,))
+    conn.commit()
+
+
 # ==================================================== travas de edicao (locks)
 def get_lock(conn, mac) -> dict | None:
     r = conn.execute("SELECT who, ts FROM edit_locks WHERE mac=%s",

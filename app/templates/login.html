@@ -25,8 +25,15 @@
         <label>Senha UniFi
           <input name="password" type="password" required>
         </label>
-        {# Host do controller e pasta do banco eram configuraveis aqui na versao
-           desktop. No servidor vem do stack (UNIFI_HOST / DATABASE_URL). #}
+        {# O host so aparece no primeiro acesso, enquanto ninguem o configurou.
+           Depois disso muda-se pela tela de Configuração. #}
+        {% if precisa_host %}
+        <label>Endereço do controller
+          <input name="host" value="{{ host }}" placeholder="https://IP-DO-CONTROLLER" required>
+        </label>
+        <span class="muted" style="font-size:12px">Primeiro acesso: informe o
+        endereço do controller. Ele fica salvo para todos.</span>
+        {% endif %}
         <button class="btn primary" type="submit">Entrar</button>
       </form>
       <p class="muted" style="font-size:12px;margin-top:10px">

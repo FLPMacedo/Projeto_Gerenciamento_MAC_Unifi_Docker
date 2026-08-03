@@ -47,15 +47,45 @@ def _handle_stop(signum, _frame):
     log.info("sinal %s recebido: encerrando apos a coleta atual", signum)
 
 
-def build_client() -> UnifiClient:
-    cfg = unifi_config_mod.resolve()
-    if not cfg or not cfg["username"] or not cfg["password"]:
-        sys.exit("Conta de servico do UniFi nao configurada: defina UNIFI_HOST, "
-                 "UNIFI_SERVICE_USERNAME e UNIFI_SERVICE_PASSWORD.")
-    return UnifiClient(
-        host=cfg["host"], username=cfg["username"], password=cfg["password"],
-        site=cfg["site"], verify_ssl=cfg["verify"],
-    )
+def build_client() -> UnifiClient | None:
+    """Resolve uma credencial utilizavel e devolve o cliente ja logado.
+
+    O coletor roda sem ninguem logado, entao usa as credenciais gravadas nos
+    logins (modelo hibrido), da que autenticou mais recentemente para a mais
+    antiga -- e a conta de servico primeiro, se estiver configurada.
+
+    Tentar mais de uma importa: a credencial do topo pode ter deixado de valer
+    (a pessoa trocou a senha, a conta foi desativada). Sem esse encadeamento a
+    coleta simplesmente pararia ate alguem logar de novo.
+    """
+    with db.connection() as conn:
+        candidatos = unifi_config_mod.collector_candidates(conn)
+
+    if not candidatos:
+        log.warning("nenhuma credencial disponivel ainda. Basta alguem fazer "
+                    "login na interface web uma vez para a coleta comecar.")
+        return None
+
+    for c in candidatos:
+        try:
+            cli = UnifiClient(
+                host=c["host"], username=c["username"], password=c["password"],
+                site=c["site"], verify_ssl=c["verify"])
+            cli.login()
+            cli.get_sites()          # confirma que tem acesso de leitura
+        except Exception as exc:     # noqa: BLE001
+            log.warning("credencial de %s nao serve (%s): %s",
+                        c["username"], c["origem"], str(exc)[:120])
+            continue
+        log.info("coletando com a credencial de %s (%s)", c["username"], c["origem"])
+        if c["origem"].startswith("login de"):
+            with db.connection() as conn:
+                db.mark_creds_ok(conn, c["username"])
+        return cli
+
+    log.error("nenhuma das %d credencial(is) autenticou. Peca para alguem "
+              "fazer login na interface web.", len(candidatos))
+    return None
 
 
 def collect_once(client: UnifiClient, respect_lease: bool = True) -> bool:
@@ -95,27 +125,30 @@ def main() -> None:
     if os.getenv("APPLY_SCHEMA", "1").lower() in {"1", "true", "yes", "on"}:
         db.apply_schema()
 
-    log.info("UniFi: %s", unifi_config_mod.describe())
-    client = build_client()
-    client.login()
+    with db.connection() as conn:
+        log.info("UniFi: %s", unifi_config_mod.describe(conn))
 
     if args.once:
+        client = build_client()
+        if client is None:
+            sys.exit("sem credencial utilizavel: faca login na interface web.")
         collect_once(client, respect_lease=False)
         return
 
     log.info("collector ativo em %s: intervalo de %ds", INSTANCE, COLLECT_INTERVAL)
+    client: UnifiClient | None = None
     while not _stop:
         try:
-            collect_once(client)
-        except UnifiError as exc:
-            log.error("erro na UniFi: %s -- refazendo login", exc)
-            try:
+            if client is None:
                 client = build_client()
-                client.login()
-            except Exception as exc2:                # noqa: BLE001
-                log.error("falha ao reconectar: %s", exc2)
+            if client is not None:
+                collect_once(client)
+        except UnifiError as exc:
+            log.error("erro na UniFi: %s -- vai reescolher a credencial", exc)
+            client = None
         except Exception as exc:                     # noqa: BLE001
             log.exception("coleta falhou: %s", exc)
+            client = None
 
         # sono fatiado para o SIGTERM ser atendido em ate 1s
         for _ in range(COLLECT_INTERVAL):

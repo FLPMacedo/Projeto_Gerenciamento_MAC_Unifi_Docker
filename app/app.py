@@ -76,13 +76,16 @@ UNITS = [u.strip() for u in os.getenv(
     "UNITS",
     "101,102,103,104,105,106,107,110,111,113,115,117").split(",") if u.strip()]
 
-_client: UnifiClient | None = None
-_client_sig = None
-# Serializa o uso do UnifiClient compartilhado DENTRO deste processo: o codigo
-# muda `client.site` antes de cada chamada, o que e estado mutavel comum.
+# Um UnifiClient POR USUARIO: cada pessoa fala com o controller usando a conta
+# dela, de modo que o log nativo da UniFi registre o autor real de cada acao.
+# Chaveado por username -> (assinatura das credenciais, client).
+_clients: dict[str, tuple[tuple, UnifiClient]] = {}
+# Serializa o uso dos clients DENTRO deste processo: o codigo muda
+# `client.site` antes de cada chamada, o que e estado mutavel compartilhado.
 # A exclusao entre PROCESSOS/CONTAINERES e feita por db.acquire_wlan_lock.
 _lock = threading.Lock()
-_sites_cache: tuple[float, list[dict]] | None = None
+# Cache de sites por usuario (permissoes podem diferir entre contas).
+_sites_cache: dict[str, tuple[float, list[dict]]] = {}
 
 
 def _flask_secret() -> str:
@@ -103,53 +106,61 @@ def bootstrap() -> None:
         db.apply_schema()
     app.secret_key = _flask_secret()
     os.makedirs(BACKUP_DIR, exist_ok=True)
-    log.info("UniFi: %s", unifi_config_mod.describe())
+    with db.connection() as conn:
+        log.info("UniFi: %s", unifi_config_mod.describe(conn))
     log.info("coleta na requisicao (COLLECT_ON_OPEN): %s",
              "ligada" if COLLECT_ON_OPEN else "desligada")
 
 
 # ----------------------------------------------------- credenciais UniFi
-def get_unifi_config() -> dict | None:
-    return unifi_config_mod.resolve()
-
-
-def unifi_configured() -> bool:
-    return unifi_config_mod.is_configured()
-
-
 def get_client() -> UnifiClient:
-    """Cliente UniFi da CONTA DE SERVICO (compartilhado no processo)."""
-    global _client, _client_sig
-    cfg = get_unifi_config()
-    if not cfg or not cfg["username"] or not cfg["password"]:
+    """Cliente UniFi da conta de QUEM ESTA LOGADO.
+
+    Cada usuario fala com o controller com a propria conta, entao as alteracoes
+    aparecem no log nativo da UniFi com o nome real do autor.
+    """
+    user = session.get("user")
+    if not user:
+        raise UnifiError("Sessão expirada. Entre novamente.")
+    with db.connection() as conn:
+        cfg = unifi_config_mod.user_credentials(conn, user)
+    if not cfg or not cfg.get("password"):
         raise UnifiError(
-            "Conta de servico do UniFi nao configurada. Defina UNIFI_HOST, "
-            "UNIFI_SERVICE_USERNAME e UNIFI_SERVICE_PASSWORD no stack.")
-    sig = (cfg["host"], cfg["site"], cfg["username"], cfg["password"], cfg["verify"])
-    if _client is None or _client_sig != sig:
-        _client = UnifiClient(host=cfg["host"], username=cfg["username"],
-                              password=cfg["password"], site=cfg["site"],
-                              verify_ssl=cfg["verify"])
-        _client.login()
-        _client_sig = sig
-    return _client
+            "Suas credenciais do UniFi não estão disponíveis. "
+            "Saia e entre novamente para revalidá-las.")
+
+    sig = (cfg["host"], cfg["site"], user, cfg["password"], cfg["verify"])
+    cached = _clients.get(user)
+    if cached and cached[0] == sig:
+        return cached[1]
+
+    client = UnifiClient(host=cfg["host"], username=user,
+                         password=cfg["password"], site=cfg["site"],
+                         verify_ssl=cfg["verify"])
+    client.login()
+    _clients[user] = (sig, client)
+    return client
 
 
-def invalidate_client() -> None:
-    global _client, _client_sig, _sites_cache
-    _client = None
-    _client_sig = None
-    _sites_cache = None
+def invalidate_client(user: str | None = None) -> None:
+    """Descarta o client em cache (do usuario informado, ou de todos)."""
+    if user:
+        _clients.pop(user, None)
+        _sites_cache.pop(user, None)
+    else:
+        _clients.clear()
+        _sites_cache.clear()
 
 
 def get_sites() -> list[dict]:
-    """Sites com cache de 5 min (a lista muda raramente)."""
-    global _sites_cache
+    """Sites com cache de 5 min por usuario (a lista muda raramente)."""
+    user = session.get("user") or "?"
     now = time.time()
-    if _sites_cache and now - _sites_cache[0] < 300:
-        return _sites_cache[1]
+    hit = _sites_cache.get(user)
+    if hit and now - hit[0] < 300:
+        return hit[1]
     sites = get_client().get_sites()
-    _sites_cache = (now, sites)
+    _sites_cache[user] = (now, sites)
     return sites
 
 
@@ -196,7 +207,8 @@ def maybe_collect(force: bool = False) -> bool:
                      len(rows), novos, _machine())
         except Exception as exc:
             log.error("coleta falhou: %s", exc)
-            invalidate_client()   # sessao pode ter expirado: forca novo login
+            # a sessao no controller pode ter expirado: forca novo login
+            invalidate_client(session.get("user"))
             return False
     return True
 
@@ -276,44 +288,55 @@ def _guard():
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
-    """Acesso validado contra o controller com a conta PESSOAL do usuario.
+    """Entrada com a conta PESSOAL do UniFi, validada ao vivo no controller.
 
-    A senha digitada e usada apenas para essa validacao e descartada em
-    seguida -- nao vai para o banco nem para disco. Quem fala com a UniFi
-    depois e a conta de servico.
+    A credencial e guardada cifrada (`user_creds`) para dois fins: as telas e as
+    acoes de escrita passarem a usar a conta desta pessoa -- assim o log nativo
+    da UniFi registra o autor real -- e o coletor, que roda sem ninguem logado,
+    ter uma credencial valida para trabalhar.
     """
-    cfg = get_unifi_config() or {}
-    host = cfg.get("host", "")
+    with db.connection() as conn:
+        cfg = unifi_config_mod.get_host(conn)
+    host = cfg["host"]
     user_saved = ""
 
     if request.method == "POST":
         user = request.form.get("username", "").strip()
         pw = request.form.get("password", "")
+        # O host so pode ser informado aqui enquanto ninguem o configurou ainda
+        # (primeiro arranque). Depois disso muda-se pela tela de Configuração.
         if not host:
-            flash("UNIFI_HOST nao configurado no servidor. Avise a TI.", "err")
-            return render_template("login.html", host=host, user_saved=user,
-                                   db_folder=None)
+            host = request.form.get("host", "").strip().rstrip("/")
+        if not host:
+            flash("Informe o endereço do controller para o primeiro acesso.", "err")
+            return render_template("login.html", host="", user_saved=user,
+                                   precisa_host=True)
         try:
             test = UnifiClient(host=host, username=user, password=pw,
-                               site=cfg.get("site", "default"),
-                               verify_ssl=cfg.get("verify", False))
+                               site=cfg["site"], verify_ssl=cfg["verify"])
             test.login()                 # valida no controller UniFi
             test.get_sites()             # garante que tem acesso de leitura
             try:
                 test.logout()
             except Exception:
                 pass
+
             session["user"] = user
             session["sid"] = uuid.uuid4().hex
             with db.connection() as conn:
+                if not unifi_config_mod.is_configured(conn):
+                    # primeiro login: fixa o controller para todo mundo
+                    unifi_config_mod.set_host(conn, host, cfg["site"], cfg["verify"])
+                db.save_user_creds(conn, user, host, cfg["site"], cfg["verify"], pw)
                 db.ping_session(conn, session["sid"], user, _machine())
+            invalidate_client(user)      # descarta client antigo desta conta
             log.info("login: %s em %s", user, _machine())
             return redirect(request.args.get("next") or url_for("overview"))
         except Exception:
             flash("Login recusado pelo UniFi: verifique usuário e senha.", "err")
             user_saved = user
     return render_template("login.html", host=host, user_saved=user_saved,
-                           db_folder=None)
+                           precisa_host=not host)
 
 
 @app.route("/logout")
@@ -327,23 +350,49 @@ def logout():
     return redirect(url_for("login"))
 
 
-@app.route("/config")
+@app.route("/config", methods=["GET", "POST"])
 def config():
-    """Somente leitura: a configuracao agora vem do ambiente (stack/secrets).
+    """Endereco do controller (editavel) + credenciais guardadas.
 
-    Na versao desktop esta tela gravava host/usuario/senha. Num servidor
-    compartilhado isso permitiria a qualquer usuario logado trocar a conta de
-    servico de todo mundo, entao virou exibicao do estado atual.
+    A SENHA nao se define aqui: ela vem do login de cada pessoa. Esta tela trata
+    do que e comum a todos (host/site/TLS) e mostra quais contas estao gravadas.
     """
-    cfg = get_unifi_config() or {}
+    with db.connection() as conn:
+        if request.method == "POST":
+            acao = request.form.get("acao", "salvar")
+            if acao == "remover" and request.form.get("username"):
+                alvo = request.form["username"]
+                db.delete_user_creds(conn, alvo)
+                invalidate_client(alvo)
+                log.info("credencial removida: %s por %s", alvo,
+                         session.get("user", ""))
+                flash(f"Credencial de {alvo} removida. Ela será regravada no "
+                      "próximo login dessa pessoa.", "ok")
+            else:
+                unifi_config_mod.set_host(
+                    conn,
+                    request.form.get("host", ""),
+                    request.form.get("site", "default"),
+                    request.form.get("verify") == "on")
+                invalidate_client()   # o endereco mudou para todo mundo
+                log.info("controller reconfigurado por %s", session.get("user", ""))
+                flash("Endereço do controller salvo.", "ok")
+            return redirect(url_for("config"))
+
+        cfg = unifi_config_mod.get_host(conn)
+        creds = db.list_user_creds(conn)
+        resumo = unifi_config_mod.describe(conn)
+
     status, detail = "ok", ""
     try:
-        detail = f"{len(get_sites())} site(s) acessiveis."
+        detail = f"{len(get_sites())} site(s) acessíveis com a sua conta."
     except Exception as exc:
         status, detail = "err", str(exc)[:200]
-    return render_template("config.html", cfg=cfg, has_pw=bool(cfg.get("password")),
-                           readonly=True, status=status, detail=detail,
-                           resumo=unifi_config_mod.describe())
+
+    return render_template("config.html", cfg=cfg, creds=creds,
+                           status=status, detail=detail, resumo=resumo,
+                           tem_servico=bool(unifi_config_mod.service_account()),
+                           me=session.get("user", ""))
 
 
 @app.route("/")
