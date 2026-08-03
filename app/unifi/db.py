@@ -115,17 +115,123 @@ def wait_ready(timeout: float = 60.0) -> None:
     raise RuntimeError(f"PostgreSQL nao respondeu em {timeout:.0f}s: {last}")
 
 
+def _dir_db() -> str:
+    app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(app_dir, "db")
+
+
 def apply_schema(schema_path: str | None = None) -> None:
-    """Aplica db/schema.sql (idempotente: tudo e CREATE ... IF NOT EXISTS)."""
+    """Aplica db/schema.sql (idempotente: tudo e CREATE ... IF NOT EXISTS).
+
+    Este arquivo e a FOTOGRAFIA do schema atual, usada para criar um banco do
+    zero. Ele NAO altera tabela que ja existe -- para isso existem as migracoes
+    versionadas (apply_migrations).
+    """
     if schema_path is None:
-        app_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         schema_path = os.getenv("SCHEMA_PATH") or os.path.join(
-            app_dir, "db", "schema.sql")
+            _dir_db(), "schema.sql")
     with open(schema_path, encoding="utf-8") as fh:
         sql = fh.read()
     with connection() as conn:
         conn.execute(sql)
         conn.commit()
+
+
+# ------------------------------------------------------------- migracoes
+_MIGR_TABELA = """
+CREATE TABLE IF NOT EXISTS schema_migrations(
+    versao     TEXT PRIMARY KEY,
+    nome       TEXT,
+    checksum   TEXT,
+    aplicada_em BIGINT,
+    baseline   SMALLINT NOT NULL DEFAULT 0
+)
+"""
+
+
+def banco_vazio(conn) -> bool:
+    """True se ainda nao existe nenhuma tabela da aplicacao."""
+    r = conn.execute("""
+        SELECT COUNT(*) AS c FROM information_schema.tables
+        WHERE table_schema = 'public' AND table_name = 'mac_state'
+    """).fetchone()
+    return r["c"] == 0
+
+
+def _migracoes_disponiveis(pasta: str | None = None) -> list[tuple[str, str, str]]:
+    """[(versao, nome, sql)] ordenadas pelo prefixo numerico do arquivo.
+
+    Convencao: db/migrations/0001_descricao_curta.sql
+    """
+    pasta = pasta or os.path.join(_dir_db(), "migrations")
+    if not os.path.isdir(pasta):
+        return []
+    out = []
+    for nome in sorted(os.listdir(pasta)):
+        if not nome.endswith(".sql"):
+            continue
+        versao = nome.split("_", 1)[0]
+        with open(os.path.join(pasta, nome), encoding="utf-8") as fh:
+            out.append((versao, nome, fh.read()))
+    return out
+
+
+def _checksum(sql: str) -> str:
+    import hashlib
+    # normaliza fim de linha: o repo e editado no Windows e roda no Linux,
+    # senao o mesmo arquivo teria checksum diferente em cada lado
+    return hashlib.sha256(sql.replace("\r\n", "\n").encode()).hexdigest()[:16]
+
+
+def apply_migrations(conn, baseline: bool = False, pasta: str | None = None) -> list[str]:
+    """Aplica as migracoes pendentes. Devolve as versoes aplicadas agora.
+
+    `baseline=True` (banco recem-criado): o schema.sql ja trouxe tudo, entao as
+    migracoes existentes sao apenas MARCADAS como aplicadas, sem executar. Sem
+    isso, um banco novo tentaria rodar um ALTER numa coluna que ja nasceu certa.
+
+    Cada migracao roda na sua propria transacao: se a de numero 3 falhar, as
+    1 e 2 permanecem aplicadas e o erro aponta exatamente onde parou.
+    """
+    conn.execute(_MIGR_TABELA)
+    conn.commit()
+
+    ja = {r["versao"]: r for r in conn.execute(
+        "SELECT versao, checksum FROM schema_migrations")}
+    agora = int(time.time())
+    aplicadas: list[str] = []
+
+    for versao, nome, sql in _migracoes_disponiveis(pasta):
+        chk = _checksum(sql)
+        if versao in ja:
+            # Migracao ja aplicada nao pode ter mudado: alterar o arquivo depois
+            # significa que os bancos ficaram diferentes entre si sem ninguem
+            # perceber. Avisa alto em vez de reaplicar por conta propria.
+            if ja[versao]["checksum"] and ja[versao]["checksum"] != chk:
+                raise RuntimeError(
+                    f"A migracao {nome} foi ALTERADA depois de aplicada "
+                    f"(checksum {ja[versao]['checksum']} -> {chk}). "
+                    "Crie uma migracao nova em vez de editar a antiga.")
+            continue
+
+        if not baseline:
+            conn.execute(sql)
+        conn.execute(
+            "INSERT INTO schema_migrations(versao, nome, checksum, aplicada_em,"
+            " baseline) VALUES (%s,%s,%s,%s,%s)",
+            (versao, nome, chk, agora, 1 if baseline else 0))
+        conn.commit()
+        aplicadas.append(versao)
+
+    return aplicadas
+
+
+def migracoes_status(conn) -> list[dict]:
+    conn.execute(_MIGR_TABELA)
+    conn.commit()
+    return [dict(r) for r in conn.execute(
+        "SELECT versao, nome, aplicada_em, baseline FROM schema_migrations "
+        "ORDER BY versao")]
 
 
 # ================================================================== escrita

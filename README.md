@@ -14,22 +14,55 @@ pywebview) continua no repositório anterior:
 ## Arquitetura
 
 ```
-Portainer ─┬─ web        Flask + gunicorn        (stateless, escalável)
-           ├─ collector  coleta a cada 10 min    (1 réplica)
-           ├─ init       aplica o schema         (one-shot)
+Portainer ─┬─ web        painel de GESTÃO      :8080  (login com conta UniFi)
+           ├─ portal     painel de EXIBIÇÃO    :8081  (login local, só lê)
+           ├─ collector  coleta a cada 10 min          (1 réplica)
+           ├─ init       schema + migrações            (one-shot)
            └─ db         PostgreSQL 17 + volume
 ```
 
-Os módulos sobem juntos pelo mesmo `docker-compose.yml` para facilitar os testes
-de implantação. Para segmentar depois, basta separar os serviços em stacks
-diferentes — eles só se comunicam pelo banco.
+`web` e `portal` usam a **mesma imagem**; o que muda é `APP_MODE`. Na porta do
+portal nenhuma rota administrativa responde — nem a tela de login.
 
 | Pasta | Conteúdo |
 |---|---|
-| `app/` | aplicação (Flask, coletor, CLI, importador) + `Dockerfile` |
-| `db/` | `schema.sql` do PostgreSQL |
+| `app/` | aplicação (Flask, portal, coletor, CLI, importador) + `Dockerfile` |
+| `db/` | `schema.sql` e `migrations/` |
 | `scripts/` | `init_db.py`, `migrate_sqlite_to_pg.py` |
 | `docs/` | manual técnico e histórico do projeto |
+
+## Os dois painéis
+
+| | Gestão (`:8080`) | Exibição (`:8081`) |
+|---|---|---|
+| Login | conta do UniFi | usuário e senha locais, criados pela TI |
+| Público | TI | portaria, recepção, líder de unidade |
+| Faz | MACs, clientes, auditoria, backup, vouchers, cadastro do portal | só mostra os vouchers da própria pessoa |
+| Fala com o controller | sim | não |
+
+## Vouchers
+
+Geração por site, com os mesmos campos da tela da UniFi. **Uso único é o
+padrão.** Multi-uso e ilimitado geram evento próprio na auditoria e um banner de
+alerta com o nome de quem gerou — voucher de uso único se esgota sozinho,
+multi-uso circula.
+
+Atribuir a uma pessoa do portal é **opcional**: sem atribuir, os códigos só
+aparecem na tela para copiar. Há botão de copiar, página de impressão (o PDF sai
+pelo "Salvar como PDF" do navegador) e export CSV.
+
+A escrita no controller ficou restrita: só o endpoint `cmd/hotspot`, e só os
+comandos `create-voucher` e `delete-voucher`.
+
+## Alterar o schema depois de subir
+
+`db/schema.sql` cria o que falta, mas **não altera tabela existente**. Para
+acrescentar coluna num banco que já tem dados, crie um arquivo em
+`db/migrations/` — veja [db/migrations/README.md](db/migrations/README.md).
+
+O runner aplica cada migração uma única vez, em transação própria, e **aborta se
+alguém editar uma migração já aplicada** (senão os bancos ficariam diferentes
+entre si sem ninguém perceber).
 
 ---
 
