@@ -1,0 +1,29 @@
+{% extends "portal_base.html" %}
+{% block content %}
+<h1>{{ 'Defina sua senha' if u.must_change else 'Trocar senha' }}</h1>
+
+{% if u.must_change %}
+<div class="flash warn">
+  Este é o seu primeiro acesso. Defina uma senha só sua antes de continuar —
+  a que a TI te passou é provisória.
+</div>
+{% endif %}
+
+<form method="post" class="cadform">
+  {% if not u.must_change %}
+  <label>Senha atual
+    <input name="atual" type="password" required autocomplete="current-password">
+  </label>
+  {% endif %}
+  <label>Nova senha
+    <input name="nova" type="password" required minlength="8" autocomplete="new-password">
+  </label>
+  <label>Repita a nova senha
+    <input name="confirma" type="password" required minlength="8" autocomplete="new-password">
+  </label>
+  <span class="muted" style="font-size:12px">
+    Pelo menos 8 caracteres e não pode ser só números.
+  </span>
+  <button class="btn primary" type="submit">Salvar</button>
+</form>
+{% endblock %}

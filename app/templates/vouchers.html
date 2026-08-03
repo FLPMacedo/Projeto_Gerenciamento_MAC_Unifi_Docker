@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Vouchers</h1>
+
+<div class="cards" style="margin-bottom:12px">
+  <a class="btn primary" href="{{ url_for('voucher_novo') }}">➕ Gerar vouchers</a>
+  <a class="btn" href="{{ url_for('portal_users') }}">👤 Usuários do portal</a>
+  <a class="btn" target="_blank"
+     href="{{ url_for('vouchers_imprimir', site=site_id) }}">🖨 Imprimir / PDF</a>
+  <a class="btn" href="{{ url_for('vouchers_csv', site=site_id) }}">⬇ CSV</a>
+</div>
+
+<p class="muted">
+  {{ stats.total }} gerado(s) por aqui · {{ stats.ativos }} ativo(s) ·
+  {{ stats.atribuidos }} atribuído(s) a alguém · {{ stats.retirados }} já retirado(s).
+  Esta tela mostra o que <b>nós</b> geramos; o controller pode ter outros,
+  criados direto na UniFi.
+</p>
+
+<form method="get" class="filtros">
+  <select name="site" onchange="this.form.submit()">
+    <option value="">Todos os sites</option>
+    {% for s in sites %}
+    <option value="{{ s.id }}" {{ 'selected' if s.id == site_id }}>{{ s.desc }}</option>
+    {% endfor %}
+  </select>
+  <input name="q" value="{{ q }}" placeholder="código, finalidade ou pessoa">
+  <button class="btn" type="submit">Buscar</button>
+</form>
+
+{% if rows %}
+<table>
+  <thead>
+    <tr>
+      <th>Código</th><th>Site</th><th>Finalidade</th><th>Tipo</th>
+      <th>Atribuído a</th><th>Gerado por</th><th>Gerado em</th>
+      <th>Retirado</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr {% if r.revogado_em %}class="off"{% endif %}>
+      <td class="mono"><b>{{ r.code }}</b></td>
+      <td class="muted">{{ r.site_desc or r.site_id }}</td>
+      <td>{{ r.note or '—' }}</td>
+      <td>
+        {% if r.quota == 1 %}Uso único
+        {% else %}<b style="color:#e0a800">{{ quota_label(r.quota) }}</b>{% endif %}
+      </td>
+      <td>{{ r.portal_nome or r.portal_username or '—' }}</td>
+      <td class="muted">{{ r.criado_por or '—' }}</td>
+      <td class="muted">{{ r.created_at|ts }}</td>
+      <td class="muted">{{ r.retirado_em|ts }}</td>
+      <td>
+        {% if r.revogado_em %}
+          <span class="muted">revogado por {{ r.revogado_por }}</span>
+        {% else %}
+        <form method="post" action="{{ url_for('voucher_revogar', grant_id=r.id) }}"
+              onsubmit="return confirm('Revogar o voucher {{ r.code }}? Isso apaga o código no controller e não tem volta.')">
+          <input type="hidden" name="confirm" value="1">
+          <button class="btn" type="submit">Revogar</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Nenhum voucher gerado por aqui ainda.</p>
+{% endif %}
+{% endblock %}

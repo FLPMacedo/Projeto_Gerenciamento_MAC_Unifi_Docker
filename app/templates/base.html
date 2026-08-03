@@ -19,6 +19,7 @@
       <a href="{{ url_for('clientes') }}">Clientes</a>
       <a href="{{ url_for('adicionar') }}">➕ Adicionar</a>
       <a href="{{ url_for('remover') }}">➖ Remover</a>
+      <a href="{{ url_for('vouchers') }}">🎟 Vouchers</a>
       <a href="{{ url_for('auditoria') }}">Auditoria</a>
       <a href="{{ url_for('backup_page') }}">⬇ Backup</a>
       <a class="cta" href="{{ url_for('refresh', next=request.path) }}">↻ Atualizar status</a>
@@ -35,6 +36,15 @@
   <a class="vipalert" href="{{ url_for('clientes_removidos', vip=1) }}">
     🚨 ALERTA: {{ vip_alert|length }} MAC(s) <b>VIP/Diretoria</b> fora da rede —
     clique para ver (não deveriam ter sido removidos).
+  </a>
+  {% endif %}
+  {% if voucher_alert %}
+  <a class="vipalert" style="background:#7a4b00;border-color:#b8860b"
+     href="{{ url_for('vouchers') }}">
+    ⚠️ {{ voucher_alert|length }} voucher(s) <b>multi-uso/ilimitado</b> gerado(s)
+    nos últimos 7 dias por
+    {{ voucher_alert|map(attribute='criado_por')|unique|join(', ') }} —
+    esse tipo circula e não se esgota sozinho. Clique para revisar.
   </a>
   {% endif %}
   <main>

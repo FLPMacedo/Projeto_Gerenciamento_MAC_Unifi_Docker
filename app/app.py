@@ -29,11 +29,11 @@ import uuid
 
 from dotenv import load_dotenv
 from flask import (
-    Flask, Response, flash, redirect, render_template, request, send_file,
-    session, url_for,
+    Flask, Response, abort, flash, redirect, render_template, request,
+    send_file, session, url_for,
 )
 
-from unifi import UnifiClient, UnifiError, db
+from unifi import UnifiClient, UnifiError, db, secret
 from unifi import config as unifi_config_mod
 from unifi.inventory import snapshot_all, collect_unifi_audit
 
@@ -45,6 +45,25 @@ app = Flask(__name__,
             static_folder=os.path.join(APP_DIR, "static"))
 
 APP_VERSION = os.getenv("APP_VERSION", "v5-docker")
+
+# Quais areas este container publica:
+#   completo -> painel administrativo + portal (padrao, deploy unico)
+#   admin    -> so o painel; /portal nao existe
+#   portal   -> so o portal de retirada; nenhuma rota administrativa e
+#               registrada, entao nao ha como alcanca-las por essa porta
+APP_MODE = os.getenv("APP_MODE", "completo").strip().lower()
+if APP_MODE not in {"completo", "admin", "portal"}:
+    raise SystemExit(f"APP_MODE invalido: {APP_MODE!r} "
+                     "(use completo, admin ou portal)")
+MODO_ADMIN = APP_MODE in {"completo", "admin"}
+MODO_PORTAL = APP_MODE in {"completo", "portal"}
+
+# Teto de vouchers por lote. A UniFi nao documenta um limite rigido e ele varia
+# por versao; 200 e um valor conservador que cobre o uso real e evita que um
+# erro de digitacao (um zero a mais) gere milhares de codigos de uma vez.
+VOUCHER_MAX_QTD = int(os.getenv("VOUCHER_MAX_QTD", "200"))
+# Unidades da tela da UniFi -> minutos (campo `expire` da API)
+VOUCHER_UNIDADES = {"minutos": 1, "horas": 60, "dias": 1440}
 DEFAULT_DAYS = db.AVAILABLE_DAYS  # 35
 NEVER_MODE = os.getenv("NEVER_MODE", "grace")  # grace | immediate
 EDIT_LOCK_TTL = 180  # segundos: aviso de edicao simultanea
@@ -229,15 +248,17 @@ def _inject_logos():
 
 @app.context_processor
 def _inject_alerts():
-    """Banner de alerta (VIP fora da rede) + nº de usuários conectados."""
+    """Banners de alerta + nº de usuários conectados."""
+    vazio = {"vip_alert": [], "voucher_alert": [], "connected": 0}
     if not session.get("user"):
-        return {"vip_alert": [], "connected": 0}
+        return vazio
     try:
         with db.connection() as conn:
             return {"vip_alert": db.vip_alerts(conn),
+                    "voucher_alert": db.voucher_alerts(conn),
                     "connected": db.active_count(conn, SESSION_TTL)}
     except Exception:
-        return {"vip_alert": [], "connected": 0}
+        return vazio
 
 
 @app.route("/healthz")
@@ -274,12 +295,32 @@ def api_close():
 
 
 # --------------------------------------------------------------------- rotas
-PUBLIC_ENDPOINTS = {"login", "static", "api_ping", "api_close", "healthz"}
+# Publicas em QUALQUER modo: servem arquivos estaticos e o healthcheck do
+# container, que precisa responder antes de existir sessao.
+SEMPRE_PUBLICOS = {"static", "healthz"}
+# Publicas so no painel de gestao (dispensam sessao, mas nao o modo admin).
+PUBLIC_ENDPOINTS = {"login", "api_ping", "api_close"}
 
 
 @app.before_request
 def _guard():
+    # O portal tem autenticacao propria (blueprint portal.py) e nao deve cair
+    # na exigencia de sessao administrativa.
+    if request.blueprint == "portal":
+        return
     ep = request.endpoint
+    # Rota inexistente: deixa o Flask devolver 404 em vez de redirecionar para
+    # o login, o que fazia toda URL errada parecer uma tela protegida.
+    if ep is None:
+        return
+    if ep in SEMPRE_PUBLICOS:
+        return
+    # Container em APP_MODE=portal: NENHUMA rota administrativa responde --
+    # nem mesmo a tela de login, que antes vazava por estar na lista de
+    # publicas e ser avaliada antes desta checagem. Devolve 404, e nao 403,
+    # para nao confirmar que a rota existe naquela porta.
+    if not MODO_ADMIN:
+        abort(404)
     if ep in PUBLIC_ENDPOINTS:
         return
     if not session.get("user"):
@@ -833,6 +874,287 @@ def auditoria_csv():
                              f'attachment; filename="auditoria_{stamp}.csv"'})
 
 
+# ======================================================= vouchers (admin)
+def _quota_label(q) -> str:
+    if q == 0:
+        return "Ilimitado"
+    if q == 1:
+        return "Uso único"
+    return f"{q} usos"
+
+
+@app.route("/vouchers")
+def vouchers():
+    site_id = request.args.get("site", "").strip()
+    q = request.args.get("q", "").strip()
+    with db.connection() as conn:
+        rows = db.list_voucher_grants(conn, site_id=site_id or None,
+                                      search=q or None, limit=500)
+        stats = db.voucher_stats(conn)
+    return render_template("vouchers.html", rows=rows, stats=stats,
+                           site_id=site_id, q=q, sites=get_sites(),
+                           quota_label=_quota_label)
+
+
+@app.route("/vouchers/novo", methods=["GET", "POST"])
+def voucher_novo():
+    with db.connection() as conn:
+        pessoas = [p for p in db.list_portal_users(conn) if p["ativo"]]
+
+    if request.method == "POST":
+        f = request.form
+        target = f.get("site", "")
+        try:
+            qtd = int(f.get("quantidade", "1"))
+            expira = int(f.get("expiracao", "24"))
+        except ValueError:
+            flash("Quantidade e expiração precisam ser números.", "err")
+            return redirect(url_for("voucher_novo"))
+
+        unidade = f.get("unidade", "horas")
+        tipo = f.get("tipo", "single")       # single | multi | unlimited
+
+        if not target:
+            flash("Selecione o site.", "err")
+            return redirect(url_for("voucher_novo"))
+        if not 1 <= qtd <= VOUCHER_MAX_QTD:
+            flash(f"Quantidade deve estar entre 1 e {VOUCHER_MAX_QTD}.", "err")
+            return redirect(url_for("voucher_novo"))
+        if expira < 1:
+            flash("A expiração precisa ser de pelo menos 1.", "err")
+            return redirect(url_for("voucher_novo"))
+        if unidade not in VOUCHER_UNIDADES:
+            flash("Unidade de expiração inválida.", "err")
+            return redirect(url_for("voucher_novo"))
+
+        if tipo == "single":
+            quota = 1
+        elif tipo == "unlimited":
+            quota = 0
+        else:
+            try:
+                quota = int(f.get("usos", "2"))
+            except ValueError:
+                quota = 2
+            if quota < 2:
+                flash("Multi-uso precisa de pelo menos 2 usos.", "err")
+                return redirect(url_for("voucher_novo"))
+
+        expire_min = expira * VOUCHER_UNIDADES[unidade]
+
+        def _num(campo, mult=1):
+            v = (f.get(campo) or "").strip()
+            try:
+                return int(float(v) * mult) if v else None
+            except ValueError:
+                return None
+
+        # a tela pede Mbps; a API trabalha em kbps
+        down = _num("download", 1000)
+        up = _num("upload", 1000)
+        dados = _num("data_limit")
+
+        pid = f.get("portal_user_id") or ""
+        portal_user_id = int(pid) if pid.isdigit() else None
+        note = f.get("nome", "").strip()
+
+        cli = get_client()
+        try:
+            with _lock:
+                cli.site = target
+                criados = cli.create_vouchers(
+                    quantidade=qtd, quota=quota, expire_min=expire_min,
+                    note=note, down_kbps=down, up_kbps=up, data_mb=dados)
+        except UnifiError as exc:
+            flash(f"Falha ao gerar: {exc}", "err")
+            return redirect(url_for("voucher_novo"))
+
+        sd = site_desc(target)
+        agora = int(time.time())
+        quem = session.get("user", "")
+        linhas = [{
+            "code": v.get("code"), "voucher_id": v.get("_id"),
+            "site_id": target, "site_desc": sd, "note": note, "quota": quota,
+            "duration_min": expire_min, "data_limit_mb": dados,
+            "down_kbps": down, "up_kbps": up,
+            "portal_user_id": portal_user_id, "criado_por": quem,
+            "create_time": v.get("create_time"), "created_at": agora,
+        } for v in criados]
+
+        with db.connection() as conn:
+            db.record_voucher_grants(conn, linhas)
+            destino = ""
+            if portal_user_id:
+                p = db.get_portal_user(conn, user_id=portal_user_id)
+                destino = f" para {p['nome'] or p['username']}" if p else ""
+            # Multi-uso e ilimitado ficam marcados a parte: circulam e nao se
+            # esgotam sozinhos, entao a geracao precisa ser visivel.
+            evento = "voucher_criado" if quota == 1 else "voucher_multi"
+            db.add_event(
+                conn, agora, target, sd, "-", evento,
+                f"{len(criados)}x {_quota_label(quota)}"
+                f"{' | ' + note if note else ''}{destino} | por {quem}")
+        log.info("vouchers: %d x %s em %s por %s", len(criados),
+                 _quota_label(quota), target, quem)
+
+        if quota != 1:
+            flash(f"ATENÇÃO: {len(criados)} voucher(s) {_quota_label(quota)} "
+                  f"gerado(s) por {quem}. Esse tipo circula — acompanhe.", "warn")
+        codigos = [v.get("code") for v in criados]
+        lote = criados[0].get("create_time") if criados else None
+        return render_template(
+            "voucher_gerado.html", criados=criados, site_desc=sd,
+            note=note, quota=quota, quota_label=_quota_label(quota),
+            expire_min=expire_min, sites=get_sites(), codigos=codigos,
+            lote=lote)
+
+    return render_template("voucher_novo.html", sites=_mobile_sites_todos(),
+                           pessoas=pessoas, max_qtd=VOUCHER_MAX_QTD,
+                           unidades=list(VOUCHER_UNIDADES))
+
+
+def _mobile_sites_todos():
+    """Todos os sites do controller (voucher e por site, nao por WLAN)."""
+    return get_sites()
+
+
+@app.route("/vouchers/<int:grant_id>/revogar", methods=["POST"])
+def voucher_revogar(grant_id):
+    with db.connection() as conn:
+        g = db.get_voucher_grant(conn, grant_id)
+    if not g:
+        flash("Voucher não encontrado.", "err")
+        return redirect(url_for("vouchers"))
+    if g["revogado_em"]:
+        flash("Esse voucher já estava revogado.", "warn")
+        return redirect(url_for("vouchers"))
+    if request.form.get("confirm") != "1":
+        flash("Marque a confirmação para revogar.", "warn")
+        return redirect(url_for("vouchers"))
+
+    quem = session.get("user", "")
+    cli = get_client()
+    try:
+        with _lock:
+            cli.site = g["site_id"]
+            if g["voucher_id"]:
+                cli.delete_voucher(g["voucher_id"])
+    except UnifiError as exc:
+        flash(f"Falha ao revogar no controller: {exc}", "err")
+        return redirect(url_for("vouchers"))
+
+    with db.connection() as conn:
+        db.mark_voucher_revogado(conn, grant_id, quem)
+        db.add_event(conn, int(time.time()), g["site_id"], g["site_desc"], "-",
+                     "voucher_revogado", f"{g['code']} | por {quem}")
+    log.info("voucher revogado: %s por %s", g["code"], quem)
+    flash(f"Voucher {g['code']} revogado.", "ok")
+    return redirect(url_for("vouchers"))
+
+
+@app.route("/vouchers/imprimir")
+def vouchers_imprimir():
+    """Pagina otimizada para impressao. O PDF sai pelo Ctrl+P do navegador
+    ('Salvar como PDF'), o que evita trazer uma biblioteca de PDF so para
+    isso e mantem a impressao direta funcionando igual.
+
+    Aceita `lote` (o create_time carimbado pela UniFi em todos os vouchers da
+    mesma geracao) ou `site`, para reimprimir o que ja existe.
+    """
+    lote = request.args.get("lote", "")
+    with db.connection() as conn:
+        rows = db.list_voucher_grants(
+            conn, site_id=request.args.get("site") or None,
+            create_time=int(lote) if lote.isdigit() else None,
+            somente_ativos=True, limit=500)
+    return render_template("vouchers_imprimir.html", rows=rows,
+                           quota_label=_quota_label, agora=int(time.time()))
+
+
+@app.route("/vouchers.csv")
+def vouchers_csv():
+    site_id = request.args.get("site", "").strip()
+    with db.connection() as conn:
+        rows = db.list_voucher_grants(conn, site_id=site_id or None, limit=100000)
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["codigo", "site", "nome", "tipo", "validade_min", "dados_mb",
+                "download_kbps", "upload_kbps", "atribuido_a", "gerado_por",
+                "gerado_em", "retirado_em", "revogado_em", "revogado_por"])
+    for r in rows:
+        w.writerow([
+            r["code"], r["site_desc"] or r["site_id"], r["note"] or "",
+            _quota_label(r["quota"]), r["duration_min"] or "",
+            r["data_limit_mb"] or "", r["down_kbps"] or "", r["up_kbps"] or "",
+            r["portal_nome"] or r["portal_username"] or "",
+            r["criado_por"] or "", _ts(r["created_at"]), _ts(r["retirado_em"]),
+            _ts(r["revogado_em"]), r["revogado_por"] or ""])
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    return Response(buf.getvalue().encode("utf-8-sig"), mimetype="text/csv",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="vouchers_{stamp}.csv"'})
+
+
+# ============================================ usuarios do portal (admin)
+@app.route("/portal-users", methods=["GET", "POST"])
+def portal_users():
+    with db.connection() as conn:
+        if request.method == "POST":
+            acao = request.form.get("acao", "criar")
+            quem = session.get("user", "")
+            if acao == "criar":
+                usuario = request.form.get("username", "").strip().lower()
+                senha = request.form.get("senha", "")
+                if not usuario:
+                    flash("Informe o usuário.", "err")
+                    return redirect(url_for("portal_users"))
+                erro = secret.validar_senha(senha)
+                if erro:
+                    flash(erro, "err")
+                    return redirect(url_for("portal_users"))
+                if db.get_portal_user(conn, username=usuario):
+                    flash(f"Já existe um usuário {usuario}.", "err")
+                    return redirect(url_for("portal_users"))
+                db.create_portal_user(
+                    conn, usuario, senha,
+                    nome=request.form.get("nome", "").strip(),
+                    setor=request.form.get("setor", "").strip(),
+                    unidade=request.form.get("unidade", "").strip(),
+                    criado_por=quem)
+                log.info("portal_user criado: %s por %s", usuario, quem)
+                flash(f"Usuário {usuario} criado. Ele troca a senha no "
+                      "primeiro acesso.", "ok")
+            elif acao == "senha":
+                uid = int(request.form["id"])
+                senha = request.form.get("senha", "")
+                erro = secret.validar_senha(senha)
+                if erro:
+                    flash(erro, "err")
+                    return redirect(url_for("portal_users"))
+                db.set_portal_password(conn, uid, senha, must_change=True)
+                log.info("portal_user senha redefinida: id=%s por %s", uid, quem)
+                flash("Senha redefinida. A pessoa troca no próximo acesso.", "ok")
+            elif acao == "ativar":
+                uid = int(request.form["id"])
+                u = db.get_portal_user(conn, user_id=uid)
+                db.update_portal_user(conn, uid, u["nome"], u["setor"],
+                                      u["unidade"], not u["ativo"])
+                flash(f"Usuário {u['username']} "
+                      f"{'ativado' if not u['ativo'] else 'desativado'}.", "ok")
+            elif acao == "remover":
+                uid = int(request.form["id"])
+                u = db.get_portal_user(conn, user_id=uid)
+                db.delete_portal_user(conn, uid)
+                log.info("portal_user removido: %s por %s", u["username"], quem)
+                flash(f"Usuário {u['username']} removido. Os vouchers dele "
+                      "continuam no histórico, sem dono.", "ok")
+            return redirect(url_for("portal_users"))
+
+        pessoas = db.list_portal_users(conn)
+    return render_template("portal_users.html", pessoas=pessoas,
+                           sites=get_sites(), units=UNITS)
+
+
 @app.template_filter("ts")
 def _ts(value):
     if not value:
@@ -840,8 +1162,13 @@ def _ts(value):
     return time.strftime("%d/%m/%Y %H:%M", time.localtime(value))
 
 
+if MODO_PORTAL:
+    from portal import bp as portal_bp
+    app.register_blueprint(portal_bp)
+
 # Executado tanto sob gunicorn (import do modulo) quanto em `python app.py`.
 bootstrap()
+log.info("APP_MODE=%s (painel=%s, portal=%s)", APP_MODE, MODO_ADMIN, MODO_PORTAL)
 
 
 if __name__ == "__main__":

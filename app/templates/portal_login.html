@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrar · Meus vouchers</title>
+  <link rel="icon" href="{{ url_for('static', filename='unifi.ico') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="loginwrap">
+    <div class="loginbox">
+      <img class="logo logo-unifi" src="{{ url_for('static', filename='logo_unifi.jpg') }}" alt="Wi-Fi">
+      <div class="brand" style="font-size:20px;margin-bottom:2px">Meus vouchers</div>
+      <p class="muted" style="margin:0 0 8px">Entre com o usuário que a TI criou para você.</p>
+      {% with msgs = get_flashed_messages(with_categories=true) %}
+        {% for cat, msg in msgs %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
+      {% endwith %}
+
+      <form method="post" class="cadform" style="max-width:none"
+            action="{{ url_for('portal.login', next=request.args.get('next','')) }}">
+        <label>Usuário
+          <input name="username" value="{{ user_saved or '' }}" autofocus required
+                 autocomplete="username">
+        </label>
+        <label>Senha
+          <input name="password" type="password" required autocomplete="current-password">
+        </label>
+        <button class="btn primary" type="submit">Entrar</button>
+      </form>
+      <p class="muted" style="font-size:12px;margin-top:10px">
+        Esqueceu a senha? Procure a TI para redefinir.
+      </p>
+    </div>
+  </div>
+</body>
+</html>

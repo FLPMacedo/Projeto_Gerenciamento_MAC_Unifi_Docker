@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Gerar vouchers</h1>
+<p class="muted">O voucher é por <b>site</b>. Atribuir a uma pessoa do portal é
+<b>opcional</b> — sem atribuir, os códigos só aparecem aqui para você copiar.</p>
+
+<form method="post" class="cadform" id="fvoucher">
+  <label>Site
+    <select name="site" required>
+      <option value="">— selecione —</option>
+      {% for s in sites %}
+      <option value="{{ s.id }}">{{ s.desc }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <div class="grid2">
+    <label>Nome / finalidade
+      <input name="nome" maxlength="60" placeholder="ex.: portaria, visitante, evento">
+    </label>
+    <label>Quantidade
+      <input name="quantidade" type="number" min="1" max="{{ max_qtd }}" value="10" required>
+      <span class="muted" style="font-size:12px">máximo {{ max_qtd }} por lote</span>
+    </label>
+  </div>
+
+  <fieldset class="tipos">
+    <legend>Tipo de uso</legend>
+    <label class="inline">
+      <input type="radio" name="tipo" value="single" checked> Uso único
+      <span class="muted">(recomendado — se esgota sozinho)</span>
+    </label>
+    <label class="inline">
+      <input type="radio" name="tipo" value="multi"> Multi-uso
+      <input name="usos" type="number" min="2" value="2" style="width:80px">
+      <span class="muted">usos</span>
+    </label>
+    <label class="inline">
+      <input type="radio" name="tipo" value="unlimited"> Ilimitado
+    </label>
+    <div class="flash warn" id="avisoMulti" style="display:none;margin-top:8px">
+      ⚠️ Multi-uso e ilimitado <b>circulam</b>: quem receber pode repassar o
+      código. A geração fica registrada na auditoria com o seu nome e aparece
+      num alerta para todos.
+    </div>
+  </fieldset>
+
+  <div class="grid2">
+    <label>Expiração
+      <input name="expiracao" type="number" min="1" value="24" required>
+    </label>
+    <label>Unidade
+      <select name="unidade">
+        {% for u in unidades %}
+        <option value="{{ u }}" {{ 'selected' if u == 'horas' }}>{{ u|capitalize }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+
+  <div class="grid2">
+    <label>Limite de dados (MB)
+      <input name="data_limit" type="number" min="1" placeholder="ilimitado">
+    </label>
+    <label>Atribuir a (opcional)
+      <select name="portal_user_id">
+        <option value="">— não atribuir —</option>
+        {% for p in pessoas %}
+        <option value="{{ p.id }}">{{ p.nome or p.username }}{% if p.setor %} · {{ p.setor }}{% endif %}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
+
+  <div class="grid2">
+    <label>Download (Mbps)
+      <input name="download" type="number" min="0" step="0.1" placeholder="sem limite">
+    </label>
+    <label>Upload (Mbps)
+      <input name="upload" type="number" min="0" step="0.1" placeholder="sem limite">
+    </label>
+  </div>
+
+  <button class="btn primary" type="submit">Gerar</button>
+  <a class="btn" href="{{ url_for('vouchers') }}">Cancelar</a>
+</form>
+
+{% if not pessoas %}
+<p class="muted" style="margin-top:14px">
+  Nenhum usuário de portal cadastrado ainda —
+  <a href="{{ url_for('portal_users') }}">cadastre em Usuários do portal</a>
+  se quiser atribuir vouchers nominalmente.
+</p>
+{% endif %}
+
+<script>
+(function(){
+  var aviso=document.getElementById("avisoMulti");
+  document.getElementById("fvoucher").addEventListener("change", function(e){
+    if(e.target.name!=="tipo") return;
+    aviso.style.display = (e.target.value==="single") ? "none" : "block";
+  });
+})();
+</script>
+{% endblock %}

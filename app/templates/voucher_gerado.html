@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ criados|length }} voucher(s) gerado(s)</h1>
+
+<div class="flash {{ 'warn' if quota != 1 else 'ok' }}">
+  {{ site_desc }} · {{ quota_label }}
+  {% if note %} · {{ note }}{% endif %}
+  · validade {{ expire_min }} min
+  {% if quota != 1 %}
+  <br><b>Atenção:</b> este tipo circula e não se esgota sozinho. A geração ficou
+  registrada na auditoria com o seu nome.
+  {% endif %}
+</div>
+
+<div class="cards" style="margin-bottom:14px">
+  <button class="btn primary" onclick="copiar()">📋 Copiar códigos</button>
+  <a class="btn" target="_blank"
+     href="{{ url_for('vouchers_imprimir', lote=lote) }}">🖨 Imprimir / PDF</a>
+  <a class="btn" href="{{ url_for('voucher_novo') }}">Gerar mais</a>
+  <a class="btn" href="{{ url_for('vouchers') }}">Ver todos</a>
+</div>
+
+<textarea id="codigos" class="codigos" rows="{{ [criados|length, 12]|min }}"
+          readonly>{{ codigos|join('\n') }}</textarea>
+<p class="muted" id="msgcopia" style="min-height:18px"></p>
+
+<table>
+  <thead><tr><th>Código</th><th>Tipo</th><th>Validade</th><th>Criado</th></tr></thead>
+  <tbody>
+    {% for v in criados %}
+    <tr>
+      <td class="mono" style="font-size:16px"><b>{{ v.code }}</b></td>
+      <td>{{ quota_label }}</td>
+      <td class="muted">{{ v.duration }} min</td>
+      <td class="muted">{{ v.create_time|ts }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<script>
+function copiar(){
+  var ta=document.getElementById("codigos");
+  var msg=document.getElementById("msgcopia");
+  function ok(){ msg.textContent="✅ "+{{ codigos|length }}+" código(s) copiado(s)."; }
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(ta.value).then(ok).catch(fallback);
+  } else { fallback(); }
+  function fallback(){
+    // http (sem TLS) nao libera a Clipboard API: usa o metodo antigo
+    ta.select(); ta.setSelectionRange(0, 99999);
+    try { document.execCommand("copy"); ok(); }
+    catch(e){ msg.textContent="Não consegui copiar — selecione o texto acima."; }
+  }
+}
+</script>
+{% endblock %}

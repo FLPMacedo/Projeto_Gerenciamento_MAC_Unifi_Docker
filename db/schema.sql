@@ -119,6 +119,66 @@ CREATE TABLE IF NOT EXISTS user_creds(
 );
 CREATE INDEX IF NOT EXISTS idx_user_creds_ok ON user_creds(last_ok DESC);
 
+-- ==================================================== vouchers de hotspot
+-- Usuarios do PORTAL: autenticacao LOCAL, separada do login administrativo.
+--
+-- O admin entra com a conta UniFi (validada no controller). Quem so vai retirar
+-- voucher -- portaria, recepcao, lider de unidade -- nao tem conta no
+-- controller, entao precisa de credencial propria, criada pela TI aqui dentro.
+--
+-- A senha e guardada como HASH (scrypt, via werkzeug.security), nunca cifrada:
+-- nao existe motivo para o sistema conseguir ler a senha de volta.
+CREATE TABLE IF NOT EXISTS portal_users(
+    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    username      TEXT UNIQUE NOT NULL,
+    nome          TEXT,
+    setor         TEXT,
+    unidade       TEXT,
+    password_hash TEXT NOT NULL,
+    ativo         SMALLINT NOT NULL DEFAULT 1,
+    -- obriga a trocar a senha no primeiro acesso (a TI define uma provisoria)
+    must_change   SMALLINT NOT NULL DEFAULT 1,
+    criado_por    TEXT,
+    created_at    BIGINT,
+    updated_at    BIGINT,
+    last_login    BIGINT,
+    -- freio contra tentativa de forca bruta: o portal usa senha simples, bem
+    -- mais fraca que a validacao contra o controller do lado administrativo
+    failed_count  SMALLINT NOT NULL DEFAULT 0,
+    locked_until  BIGINT
+);
+CREATE INDEX IF NOT EXISTS idx_portal_users_ativo ON portal_users(ativo);
+
+-- Vouchers gerados por nos e atribuidos nominalmente a alguem do portal.
+--
+-- A UniFi ja guarda o voucher e o admin_name de quem criou, mas expira e apaga
+-- os antigos. Esta tabela preserva o historico -- quem gerou, para quem, com
+-- que finalidade e quando a pessoa retirou -- do mesmo modo que ja fazemos com
+-- o espelho do log nativo.
+CREATE TABLE IF NOT EXISTS voucher_grants(
+    id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    code           TEXT NOT NULL,          -- codigo impresso do voucher
+    voucher_id     TEXT,                   -- _id na UniFi (necessario p/ revogar)
+    site_id        TEXT NOT NULL,
+    site_desc      TEXT,
+    note           TEXT,                   -- campo "Name" do formulario
+    quota          SMALLINT,               -- 0=ilimitado | 1=uso unico | N=N usos
+    duration_min   BIGINT,                 -- expiracao em MINUTOS (campo da API)
+    data_limit_mb  BIGINT,
+    down_kbps      BIGINT,
+    up_kbps        BIGINT,
+    portal_user_id BIGINT REFERENCES portal_users(id) ON DELETE SET NULL,
+    criado_por     TEXT,                   -- conta UniFi do admin que gerou
+    create_time    BIGINT,                 -- create_time devolvido pela UniFi
+    created_at     BIGINT,
+    retirado_em    BIGINT,                 -- quando a pessoa viu o codigo no portal
+    revogado_em    BIGINT,
+    revogado_por   TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vgrants_code ON voucher_grants(site_id, code);
+CREATE INDEX IF NOT EXISTS idx_vgrants_user ON voucher_grants(portal_user_id);
+CREATE INDEX IF NOT EXISTS idx_vgrants_criado ON voucher_grants(created_at DESC);
+
 -- ------------------------------------------------------- estado efemero
 -- Estas tres tabelas expiram sozinhas por TTL (20s a 180s). Sao migradas por
 -- fidelidade, mas qualquer residuo se resolve em menos de 3 minutos.

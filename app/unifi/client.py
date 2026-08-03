@@ -239,6 +239,91 @@ class UnifiClient:
         j = resp.json()
         return j.get("data", []), j.get("total_element_count", 0)
 
+    # ------------------------------------------------- vouchers de hotspot
+    # Comandos de escrita PERMITIDOS em cmd/hotspot. A lista e fechada de
+    # proposito: o mesmo endpoint aceita outras operacoes (autorizar convidado,
+    # desconectar cliente, estender sessao) que este sistema nao deve executar.
+    _HOTSPOT_CMDS = {"create-voucher", "delete-voucher"}
+
+    def _hotspot_cmd(self, payload: dict) -> Any:
+        """Unico caminho de POST liberado, e so para cmd/hotspot.
+
+        `_request` continua barrando POST para todo o resto. A abertura e
+        estreita de proposito: a regra do projeto e nao escrever no controller
+        alem do estritamente necessario -- aqui, criar e revogar voucher.
+        """
+        cmd = payload.get("cmd")
+        if cmd not in self._HOTSPOT_CMDS:
+            raise UnifiError(f"Comando de hotspot nao permitido: {cmd!r}")
+        url = self._net_url("cmd/hotspot")
+        try:
+            resp = self.session.post(url, headers=self._headers(),
+                                     json=payload, timeout=self.timeout)
+        except requests.RequestException as exc:
+            raise UnifiError(f"Falha de conexao com {url}: {exc}") from exc
+        self._capture_csrf(resp)
+        if resp.status_code == 401 and self._logged_in:
+            self._logged_in = False
+            self.login()
+            resp = self.session.post(url, headers=self._headers(),
+                                     json=payload, timeout=self.timeout)
+            self._capture_csrf(resp)
+        if not resp.ok:
+            raise UnifiError(f"HTTP {resp.status_code} em {url}: {resp.text[:300]}")
+        return self._data(resp.json() if resp.content else None)
+
+    def get_vouchers(self, site: str | None = None) -> list[dict]:
+        """Vouchers do site (leitura)."""
+        if site:
+            self.site = site
+        return self._data(self._request("GET", self._net_url("stat/voucher")))
+
+    def create_vouchers(self, *, quantidade: int, quota: int, expire_min: int,
+                        note: str = "", down_kbps: int | None = None,
+                        up_kbps: int | None = None,
+                        data_mb: int | None = None) -> list[dict]:
+        """Cria vouchers e devolve os registros criados, ja com os codigos.
+
+        quota: 0 = ilimitado | 1 = uso unico | N = N usos
+        expire_min: validade em MINUTOS (a tela da UniFi mostra horas/dias)
+        down_kbps/up_kbps: limites de velocidade em kbps (a tela mostra Mbps)
+        data_mb: franquia de dados em MB
+
+        A API NAO devolve os codigos na resposta do create: responde apenas com
+        o `create_time` do lote. Os codigos saem de uma segunda consulta,
+        filtrando stat/voucher por esse mesmo create_time.
+        """
+        payload: dict[str, Any] = {
+            "cmd": "create-voucher",
+            "n": int(quantidade),
+            "quota": int(quota),
+            "expire": int(expire_min),
+            "note": note or "",
+        }
+        # So enviamos os limites quando ha valor: mandar zero faz a UniFi
+        # registrar o voucher com limite zerado em vez de "sem limite".
+        if down_kbps:
+            payload["down"] = int(down_kbps)
+        if up_kbps:
+            payload["up"] = int(up_kbps)
+        if data_mb:
+            payload["bytes"] = int(data_mb)
+
+        res = self._hotspot_cmd(payload)
+        ct = res[0].get("create_time") if res and isinstance(res[0], dict) else None
+        if not ct:
+            raise UnifiError("A UniFi nao devolveu o create_time do lote; "
+                             "nao foi possivel recuperar os codigos gerados.")
+        criados = [v for v in self.get_vouchers() if v.get("create_time") == ct]
+        if not criados:
+            raise UnifiError("Lote criado, mas nenhum voucher foi encontrado "
+                             f"com create_time={ct}.")
+        return criados
+
+    def delete_voucher(self, voucher_id: str) -> None:
+        """Revoga (apaga) um voucher no controller."""
+        self._hotspot_cmd({"cmd": "delete-voucher", "_id": voucher_id})
+
     # ----------------------------------------- edicao da allow-list (unitaria)
     def set_mac_filter_list(self, wlan_id: str, macs: list[str]) -> Any:
         norm = [self.normalize_mac(m) for m in macs]

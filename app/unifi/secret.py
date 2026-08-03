@@ -61,3 +61,36 @@ def decrypt(conn, token: str) -> str:
         return Fernet(load_key(conn)).decrypt(token.encode()).decode()
     except (InvalidToken, ValueError, TypeError):
         return ""
+
+
+# ============================================ senhas do portal (HASH, nao cripto)
+# As senhas do portal sao guardadas como HASH e nunca como texto cifrado: o
+# sistema so precisa CONFERIR a senha, nunca le-la de volta. Isso e diferente da
+# senha do UniFi acima, que precisa ser recuperada para falar com o controller.
+#
+# scrypt via werkzeug.security -- ja vem com o Flask, sem dependencia nova.
+from werkzeug.security import check_password_hash, generate_password_hash  # noqa: E402
+
+SENHA_MINIMA = 8
+
+
+def hash_password(senha: str) -> str:
+    return generate_password_hash(senha, method="scrypt")
+
+
+def verify_password(hash_guardado: str, senha: str) -> bool:
+    if not hash_guardado or not senha:
+        return False
+    try:
+        return check_password_hash(hash_guardado, senha)
+    except (ValueError, TypeError):
+        return False
+
+
+def validar_senha(senha: str) -> str | None:
+    """Devolve a mensagem de erro, ou None se a senha serve."""
+    if len(senha or "") < SENHA_MINIMA:
+        return f"A senha precisa ter pelo menos {SENHA_MINIMA} caracteres."
+    if senha.isdigit():
+        return "A senha não pode ser só números."
+    return None

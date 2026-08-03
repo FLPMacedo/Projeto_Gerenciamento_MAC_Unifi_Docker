@@ -535,6 +535,226 @@ def delete_user_creds(conn, username) -> None:
     conn.commit()
 
 
+# ================================================== portal: usuarios locais
+# Autenticacao SEPARADA do login administrativo. O admin entra com a conta do
+# UniFi; quem so retira voucher (portaria, recepcao, lider) nao tem conta no
+# controller e recebe credencial local criada pela TI.
+PORTAL_MAX_TENTATIVAS = 5
+PORTAL_BLOQUEIO_SEG = 900          # 15 min
+
+
+def create_portal_user(conn, username, senha, nome="", setor="", unidade="",
+                       criado_por="") -> int:
+    from . import secret
+    now = int(time.time())
+    r = conn.execute(
+        "INSERT INTO portal_users(username, nome, setor, unidade, password_hash,"
+        " ativo, must_change, criado_por, created_at, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,1,1,%s,%s,%s) RETURNING id",
+        (username.strip().lower(), nome, setor, unidade,
+         secret.hash_password(senha), criado_por, now, now)).fetchone()
+    conn.commit()
+    return r["id"]
+
+
+def get_portal_user(conn, username=None, user_id=None) -> dict | None:
+    if user_id is not None:
+        r = conn.execute("SELECT * FROM portal_users WHERE id=%s",
+                         (user_id,)).fetchone()
+    else:
+        r = conn.execute("SELECT * FROM portal_users WHERE username=%s",
+                         ((username or "").strip().lower(),)).fetchone()
+    return dict(r) if r else None
+
+
+def list_portal_users(conn) -> list[dict]:
+    """Sem o hash da senha: esta lista vai para a tela."""
+    return [dict(r) for r in conn.execute(
+        "SELECT id, username, nome, setor, unidade, ativo, must_change, "
+        "criado_por, created_at, updated_at, last_login, locked_until "
+        "FROM portal_users ORDER BY nome NULLS LAST, username")]
+
+
+def set_portal_password(conn, user_id, senha, must_change=False) -> None:
+    from . import secret
+    conn.execute(
+        "UPDATE portal_users SET password_hash=%s, must_change=%s, "
+        "updated_at=%s, failed_count=0, locked_until=NULL WHERE id=%s",
+        (secret.hash_password(senha), 1 if must_change else 0,
+         int(time.time()), user_id))
+    conn.commit()
+
+
+def update_portal_user(conn, user_id, nome, setor, unidade, ativo) -> None:
+    conn.execute(
+        "UPDATE portal_users SET nome=%s, setor=%s, unidade=%s, ativo=%s, "
+        "updated_at=%s WHERE id=%s",
+        (nome, setor, unidade, 1 if ativo else 0, int(time.time()), user_id))
+    conn.commit()
+
+
+def delete_portal_user(conn, user_id) -> None:
+    conn.execute("DELETE FROM portal_users WHERE id=%s", (user_id,))
+    conn.commit()
+
+
+def check_portal_login(conn, username, senha) -> tuple[dict | None, str]:
+    """Valida o acesso ao portal. Devolve (usuario, motivo_da_recusa).
+
+    Trava a conta por PORTAL_BLOQUEIO_SEG apos PORTAL_MAX_TENTATIVAS erros.
+    O portal usa senha simples -- bem mais fraca que a validacao contra o
+    controller do lado administrativo -- entao o freio contra forca bruta e
+    parte do desenho, nao um extra.
+    """
+    from . import secret
+    u = get_portal_user(conn, username=username)
+    if not u:
+        # custo de hash mesmo sem usuario, para nao vazar quem existe pelo tempo
+        secret.verify_password(
+            "scrypt:32768:8:1$x$0" * 1, senha or "")
+        return None, "Usuário ou senha inválidos."
+    if not u["ativo"]:
+        return None, "Usuário desativado. Procure a TI."
+
+    agora = int(time.time())
+    if u["locked_until"] and u["locked_until"] > agora:
+        faltam = (u["locked_until"] - agora + 59) // 60
+        return None, f"Conta bloqueada por tentativas seguidas. Tente em {faltam} min."
+
+    if not secret.verify_password(u["password_hash"], senha):
+        falhas = (u["failed_count"] or 0) + 1
+        trava = agora + PORTAL_BLOQUEIO_SEG if falhas >= PORTAL_MAX_TENTATIVAS else None
+        conn.execute(
+            "UPDATE portal_users SET failed_count=%s, locked_until=%s WHERE id=%s",
+            (falhas, trava, u["id"]))
+        conn.commit()
+        if trava:
+            return None, ("Conta bloqueada por 15 minutos após "
+                          f"{PORTAL_MAX_TENTATIVAS} tentativas.")
+        return None, "Usuário ou senha inválidos."
+
+    conn.execute(
+        "UPDATE portal_users SET failed_count=0, locked_until=NULL, "
+        "last_login=%s WHERE id=%s", (agora, u["id"]))
+    conn.commit()
+    u["failed_count"] = 0
+    u["locked_until"] = None
+    u["last_login"] = agora
+    return u, ""
+
+
+# ==================================================== vouchers de hotspot
+VOUCHER_CAMPOS = ("code", "voucher_id", "site_id", "site_desc", "note", "quota",
+                  "duration_min", "data_limit_mb", "down_kbps", "up_kbps",
+                  "portal_user_id", "criado_por", "create_time", "created_at")
+
+
+def record_voucher_grants(conn, linhas: list[dict]) -> int:
+    """Guarda os vouchers recem-criados. ON CONFLICT protege contra reenvio."""
+    if not linhas:
+        return 0
+    agora = int(time.time())
+    payload = [
+        tuple(r.get(c) if c != "created_at" else (r.get("created_at") or agora)
+              for c in VOUCHER_CAMPOS)
+        for r in linhas
+    ]
+    cols = ", ".join(VOUCHER_CAMPOS)
+    ph = ", ".join(["%s"] * len(VOUCHER_CAMPOS))
+    with conn.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO voucher_grants({cols}) VALUES ({ph}) "
+            f"ON CONFLICT (site_id, code) DO NOTHING", payload)
+        n = cur.rowcount
+    conn.commit()
+    return max(n, 0)
+
+
+_VG_SELECT = """
+SELECT g.*, p.username AS portal_username, p.nome AS portal_nome
+FROM voucher_grants g
+LEFT JOIN portal_users p ON p.id = g.portal_user_id
+"""
+
+
+def list_voucher_grants(conn, site_id=None, portal_user_id=None,
+                        somente_ativos=False, search=None, create_time=None,
+                        limit=500) -> list[dict]:
+    q = _VG_SELECT
+    where, args = [], []
+    if site_id:
+        where.append("g.site_id=%s"); args.append(site_id)
+    if portal_user_id is not None:
+        where.append("g.portal_user_id=%s"); args.append(portal_user_id)
+    if create_time:
+        # identifica um LOTE: a UniFi carimba o mesmo create_time em todos os
+        # vouchers gerados na mesma operacao
+        where.append("g.create_time=%s"); args.append(create_time)
+    if somente_ativos:
+        where.append("g.revogado_em IS NULL")
+    if search:
+        s = f"%{search.strip()}%"
+        where.append("(g.code LIKE %s OR g.note LIKE %s OR p.nome LIKE %s "
+                     "OR p.username LIKE %s)")
+        args += [s, s, s, s]
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY g.created_at DESC, g.id DESC LIMIT %s"
+    args.append(limit)
+    return [dict(r) for r in conn.execute(q, args)]
+
+
+def get_voucher_grant(conn, grant_id) -> dict | None:
+    r = conn.execute(_VG_SELECT + " WHERE g.id=%s", (grant_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def mark_voucher_retirado(conn, grant_id) -> None:
+    """Primeira vez que a pessoa viu o codigo no portal (nao sobrescreve)."""
+    conn.execute(
+        "UPDATE voucher_grants SET retirado_em=%s "
+        "WHERE id=%s AND retirado_em IS NULL", (int(time.time()), grant_id))
+    conn.commit()
+
+
+def mark_voucher_revogado(conn, grant_id, quem) -> None:
+    conn.execute(
+        "UPDATE voucher_grants SET revogado_em=%s, revogado_por=%s WHERE id=%s",
+        (int(time.time()), quem, grant_id))
+    conn.commit()
+
+
+def voucher_alerts(conn, dias: int = 7) -> list[dict]:
+    """Vouchers MULTI-USO ou ILIMITADOS gerados recentemente.
+
+    Voucher de uso unico se esgota sozinho; multi-uso e ilimitado circulam --
+    um codigo repassado adiante libera acesso indefinidamente. Por isso toda
+    geracao desse tipo fica visivel num alerta, com o nome de quem gerou, em vez
+    de ficar so no historico. Mesma logica do alerta de VIP fora da allow-list.
+    """
+    corte = int(time.time()) - dias * DAY
+    rows = conn.execute("""
+        SELECT g.id, g.code, g.note, g.quota, g.site_desc, g.criado_por,
+               g.created_at, p.nome AS portal_nome
+        FROM voucher_grants g
+        LEFT JOIN portal_users p ON p.id = g.portal_user_id
+        WHERE g.quota <> 1 AND g.revogado_em IS NULL AND g.created_at >= %s
+        ORDER BY g.created_at DESC
+    """, (corte,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def voucher_stats(conn) -> dict:
+    r = conn.execute("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE revogado_em IS NULL) AS ativos,
+               COUNT(*) FILTER (WHERE retirado_em IS NOT NULL) AS retirados,
+               COUNT(*) FILTER (WHERE portal_user_id IS NOT NULL) AS atribuidos
+        FROM voucher_grants
+    """).fetchone()
+    return dict(r)
+
+
 # ==================================================== travas de edicao (locks)
 def get_lock(conn, mac) -> dict | None:
     r = conn.execute("SELECT who, ts FROM edit_locks WHERE mac=%s",
@@ -750,6 +970,9 @@ EVENT_LABEL = {
     "vip_removido": "VIP REMOVIDO",
     "add_manual": "Adicionado (manual)", "remove_manual": "Removido (manual)",
     "troca": "Troca de aparelho",
+    "voucher_criado": "Voucher gerado",
+    "voucher_multi": "Voucher MULTI-USO gerado",
+    "voucher_revogado": "Voucher revogado",
 }
 
 

@@ -91,10 +91,46 @@ services:
       FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:-}
       # Quem coleta e o collector; o web so le.
       COLLECT_ON_OPEN: "0"
+      # Painel de gestao: sem as rotas do portal de exibicao.
+      APP_MODE: admin
     ports:
       - "${WEB_PORT:-8080}:5000"
     volumes:
       - appdata:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------- portal de exibicao (vouchers)
+  # Mesma imagem do web, porta propria e APP_MODE=portal: nenhuma rota
+  # administrativa responde nesta porta. Publico diferente (portaria, recepcao),
+  # login local proprio, e a tela so EXIBE os vouchers atribuidos a pessoa.
+  portal:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: gestaomac-app:latest
+    restart: unless-stopped
+    environment:
+      <<: *app_env
+      APP_MODE: portal
+      # Mesmo segredo do web: as duas areas usam o mesmo cookie de sessao,
+      # mas chaves distintas dentro dele (session["user"] x ["portal_uid"]).
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY:-}
+      COLLECT_ON_OPEN: "0"
+    ports:
+      - "${PORTAL_PORT:-8081}:5000"
+    volumes:
+      - appdata:/data
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:5000/portal/healthz', timeout=4).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
     depends_on:
       db:
         condition: service_healthy

@@ -1,0 +1,65 @@
+{% extends "portal_base.html" %}
+{% block content %}
+<h1>Olá, {{ u.nome or u.username }}</h1>
+
+{% if vouchers %}
+<p class="muted">
+  {{ vouchers|length }} voucher(s) disponível(is) para você. Informe o código na
+  tela de acesso à rede Wi-Fi.
+</p>
+
+<div class="cards" style="margin-bottom:12px">
+  <button class="btn primary" onclick="copiar()">📋 Copiar códigos</button>
+  <button class="btn" onclick="window.print()">🖨 Imprimir</button>
+</div>
+
+<textarea id="codigos" class="codigos" rows="{{ [vouchers|length, 10]|min }}"
+          readonly>{{ vouchers|map(attribute='code')|join('\n') }}</textarea>
+<p class="muted" id="msgcopia" style="min-height:18px"></p>
+
+<table>
+  <thead>
+    <tr><th>Código</th><th>Local</th><th>Finalidade</th><th>Tipo</th><th>Validade</th></tr>
+  </thead>
+  <tbody>
+    {% for v in vouchers %}
+    <tr>
+      <td class="mono" style="font-size:17px"><b>{{ v.code }}</b></td>
+      <td class="muted">{{ v.site_desc or '—' }}</td>
+      <td>{{ v.note or '—' }}</td>
+      <td>{% if v.quota == 1 %}Uso único{% elif v.quota == 0 %}Ilimitado{% else %}{{ v.quota }} usos{% endif %}</td>
+      <td class="muted">
+        {% if v.duration_min %}
+          {% if v.duration_min >= 1440 %}{{ v.duration_min // 1440 }} dia(s)
+          {% elif v.duration_min >= 60 %}{{ v.duration_min // 60 }} hora(s)
+          {% else %}{{ v.duration_min }} min{% endif %}
+        {% else %}—{% endif %}
+        {% if v.data_limit_mb %} · {{ v.data_limit_mb }} MB{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<script>
+function copiar(){
+  var ta=document.getElementById("codigos");
+  var msg=document.getElementById("msgcopia");
+  function ok(){ msg.textContent="✅ Código(s) copiado(s)."; }
+  if(navigator.clipboard && window.isSecureContext){
+    navigator.clipboard.writeText(ta.value).then(ok).catch(fb);
+  } else { fb(); }
+  function fb(){
+    ta.select(); ta.setSelectionRange(0, 99999);
+    try { document.execCommand("copy"); ok(); }
+    catch(e){ msg.textContent="Selecione o texto acima para copiar."; }
+  }
+}
+</script>
+{% else %}
+<p class="muted">
+  Você não tem vouchers disponíveis no momento. Quando a TI gerar vouchers para
+  você, eles aparecem aqui.
+</p>
+{% endif %}
+{% endblock %}

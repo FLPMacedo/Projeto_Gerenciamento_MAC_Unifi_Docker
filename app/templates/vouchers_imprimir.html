@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <title>Vouchers para impressão</title>
+  <style>
+    /* Folha propria, sem o tema escuro: impressao em fundo branco economiza
+       toner e fica legivel. O PDF sai pelo "Salvar como PDF" do navegador. */
+    body { font-family: system-ui, Arial, sans-serif; color:#111; background:#fff;
+           margin:16px; }
+    h1 { font-size:18px; margin:0 0 4px; }
+    .sub { font-size:12px; color:#555; margin:0 0 14px; }
+    .grade { display:grid; grid-template-columns:repeat(3, 1fr); gap:10px; }
+    .v { border:1px dashed #999; border-radius:6px; padding:10px; }
+    .cod { font-family:"Courier New",monospace; font-size:22px; font-weight:700;
+           letter-spacing:2px; }
+    .meta { font-size:11px; color:#444; margin-top:6px; line-height:1.45; }
+    .multi { color:#a15c00; font-weight:700; }
+    .acoes { margin:0 0 14px; }
+    button { font-size:14px; padding:6px 14px; cursor:pointer; }
+    @media print {
+      .acoes { display:none; }
+      .v { break-inside:avoid; }
+      body { margin:0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="acoes">
+    <button onclick="window.print()">🖨 Imprimir / Salvar como PDF</button>
+  </div>
+
+  <h1>Vouchers de acesso Wi-Fi</h1>
+  <p class="sub">{{ rows|length }} voucher(s) · gerado em {{ agora|ts if agora }}</p>
+
+  {% if rows %}
+  <div class="grade">
+    {% for r in rows %}
+    <div class="v">
+      <div class="cod">{{ r.code }}</div>
+      <div class="meta">
+        {{ r.site_desc or r.site_id }}<br>
+        {% if r.note %}{{ r.note }}<br>{% endif %}
+        {% if r.quota == 1 %}Uso único
+        {% else %}<span class="multi">{{ quota_label(r.quota) }}</span>{% endif %}
+        {% if r.duration_min %} · validade {{ (r.duration_min // 60) or r.duration_min }}
+          {{ 'h' if r.duration_min >= 60 else 'min' }}{% endif %}
+        {% if r.data_limit_mb %} · {{ r.data_limit_mb }} MB{% endif %}
+        {% if r.portal_nome %}<br>Para: {{ r.portal_nome }}{% endif %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <p>Nenhum voucher para imprimir.</p>
+  {% endif %}
+</body>
+</html>

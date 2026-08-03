@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Usuários do portal</h1>
+<p class="muted">
+  Contas <b>locais</b>, criadas por vocês, para quem só retira voucher —
+  portaria, recepção, líder de unidade. Não são contas do UniFi e não dão acesso
+  a este painel: servem apenas para abrir o portal de exibição e ver os próprios
+  vouchers.
+</p>
+
+<h2 class="sec">Novo usuário</h2>
+<form method="post" class="cadform">
+  <input type="hidden" name="acao" value="criar">
+  <div class="grid2">
+    <label>Usuário (login)
+      <input name="username" required maxlength="40" placeholder="ex.: portaria.pn">
+    </label>
+    <label>Nome
+      <input name="nome" maxlength="80" placeholder="ex.: Portaria Ponte Nova">
+    </label>
+  </div>
+  <div class="grid2">
+    <label>Setor
+      <input name="setor" maxlength="40">
+    </label>
+    <label>Unidade
+      <select name="unidade">
+        <option value="">—</option>
+        {% for u in units %}<option value="{{ u }}">{{ u }}</option>{% endfor %}
+      </select>
+    </label>
+  </div>
+  <label>Senha provisória
+    <input name="senha" type="password" required minlength="8" autocomplete="new-password">
+    <span class="muted" style="font-size:12px">
+      Mínimo 8 caracteres, não só números. A pessoa é obrigada a trocar no
+      primeiro acesso.
+    </span>
+  </label>
+  <button class="btn primary" type="submit">Criar</button>
+</form>
+
+<h2 class="sec" style="margin-top:24px">Cadastrados</h2>
+{% if pessoas %}
+<table>
+  <thead>
+    <tr><th>Usuário</th><th>Nome</th><th>Setor / Unidade</th><th>Situação</th>
+        <th>Último acesso</th><th>Ações</th></tr>
+  </thead>
+  <tbody>
+    {% for p in pessoas %}
+    <tr {% if not p.ativo %}class="off"{% endif %}>
+      <td class="mono">{{ p.username }}</td>
+      <td>{{ p.nome or '—' }}</td>
+      <td class="muted">{{ p.setor or '—' }}{% if p.unidade %} · {{ p.unidade }}{% endif %}</td>
+      <td>
+        {% if not p.ativo %}<span class="muted">desativado</span>
+        {% elif p.must_change %}<span style="color:#e0a800">senha provisória</span>
+        {% elif p.locked_until %}<span style="color:#e0a800">bloqueado</span>
+        {% else %}ativo{% endif %}
+      </td>
+      <td class="muted">{{ p.last_login|ts }}</td>
+      <td>
+        <form method="post" style="display:inline-flex;gap:4px;align-items:center">
+          <input type="hidden" name="acao" value="senha">
+          <input type="hidden" name="id" value="{{ p.id }}">
+          <input name="senha" type="password" placeholder="nova senha"
+                 minlength="8" style="width:130px" required>
+          <button class="btn" type="submit">Redefinir</button>
+        </form>
+        <form method="post" style="display:inline">
+          <input type="hidden" name="acao" value="ativar">
+          <input type="hidden" name="id" value="{{ p.id }}">
+          <button class="btn" type="submit">{{ 'Ativar' if not p.ativo else 'Desativar' }}</button>
+        </form>
+        <form method="post" style="display:inline"
+              onsubmit="return confirm('Remover {{ p.username }}? Os vouchers dele ficam no histórico, sem dono.')">
+          <input type="hidden" name="acao" value="remover">
+          <input type="hidden" name="id" value="{{ p.id }}">
+          <button class="btn" type="submit">Remover</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">Nenhum usuário de portal cadastrado ainda.</p>
+{% endif %}
+{% endblock %}
