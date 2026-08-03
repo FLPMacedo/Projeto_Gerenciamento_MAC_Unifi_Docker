@@ -1,34 +1,48 @@
+# Contexto de build = raiz do repositorio (ver docker-compose.yml).
+#
+# ATENCAO ao padrao: no .dockerignore, "*.db" casa APENAS na raiz. Para pegar
+# subpastas e preciso "**/*.db". Sem isso, arquivos como migracao/history.db
+# (27 MB) e a copia da instalacao antiga entrariam no contexto, deixando o
+# build lento e arriscando vazar dado sensivel para dentro da imagem.
+
 .git
 .gitignore
-.venv
-venv
-__pycache__
+.gitattributes
+**/.venv
+**/venv
 **/__pycache__
-*.pyc
+**/*.pyc
+**/*.pyo
 
-# segredos e dados locais
+# --- segredos e dados locais ---
 .env
-*.key
-creds.enc
-*.enc
-sites_map.json
-*.db
-*.sqlite*
-*.xlsx
-data/
-backups/
-logs/
+**/.env
+**/*.key
+**/creds.enc
+**/*.enc
+**/sites_map.json
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.dump
+**/*.xlsx
+**/data/
+**/backups/
+**/logs/
+**/*.log
 
-# copia da instalacao de producao (fonte da migracao, nao vai para a imagem)
+# --- copia da instalacao de producao e material da migracao ---
 _Projeto_Gerenciamento_MAC_Unifi/
+migracao/
 
-# artefatos da versao desktop
-dist/
-build/
-pacote/
-*.exe
-*.zip
-*.spec
+# --- artefatos da versao desktop ---
+**/dist/
+**/build/
+**/pacote/
+**/*.exe
+**/*.zip
+**/*.spec
 
+# --- documentacao (nao precisa na imagem) ---
 docs/
 *.md

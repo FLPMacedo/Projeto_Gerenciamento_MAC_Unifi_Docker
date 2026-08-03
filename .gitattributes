@@ -1,0 +1,33 @@
+# Normalizacao de fim de linha.
+#
+# A estacao de desenvolvimento e Windows com core.autocrlf=true, mas tudo aqui
+# roda dentro de container Linux. Sem estas regras, um clone novo no Windows
+# traria CRLF e:
+#   - o Dockerfile quebraria nas continuacoes de linha ("\" seguido de CR)
+#   - o schema.sql e os .py entrariam na imagem com CR sobrando
+# O `text eol=lf` garante LF no working tree independentemente da plataforma.
+
+* text=auto eol=lf
+
+Dockerfile      text eol=lf
+*.sh            text eol=lf
+*.sql           text eol=lf
+*.py            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.html          text eol=lf
+*.css           text eol=lf
+*.md            text eol=lf
+*.txt           text eol=lf
+.env.example    text eol=lf
+
+# Binarios: nunca converter
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.ico    binary
+*.webp   binary
+*.pdf    binary
+*.xlsx   binary
+*.db     binary
+*.dump   binary
