@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="topbar">
+  <h1>Selecione o site</h1>
+  <a class="btn primary" href="{{ url_for('overview') }}">📊 Visão geral (todos os sites)</a>
+</div>
+<p class="muted">{{ sites|length }} sites encontrados no controller.</p>
+<div class="grid">
+  {% for s in sites %}
+  <a class="card" href="{{ url_for('dashboard', site_id=s.id) }}">
+    <strong>{{ s.desc }}</strong>
+    <span class="muted">id: {{ s.id }}</span>
+  </a>
+  {% endfor %}
+</div>
+{% endblock %}

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block content %}
+<script>window.AUTO_REFRESH=true;</script>
+<div class="topbar">
+  <h1>{{ 'Usuários removidos' if view=='removed' else 'Clientes' }}</h1>
+  <div class="filters">
+    <a class="chip {{ 'active' if view=='active' and not only_vip }}" href="{{ url_for('clientes') }}">Ativos</a>
+    <a class="chip {{ 'active' if view=='removed' and not only_vip }}" href="{{ url_for('clientes_removidos') }}">Removidos ({{ removed_count if view=='active' else rows|length }})</a>
+    <a class="chip {{ 'active' if only_vip }}" href="{{ url_for('clientes', vip=1) if view=='active' else url_for('clientes_removidos', vip=1) }}">★ VIP</a>
+    <a class="chip {{ 'active' if sem_termo }}" href="{{ url_for('clientes', termo='sem') if view=='active' else url_for('clientes_removidos', termo='sem') }}">📄 Sem termo</a>
+  </div>
+</div>
+
+<form method="get" class="searchbar">
+  <input type="text" name="q" value="{{ q }}" placeholder="Buscar por nome, setor, MAC, aparelho...">
+  <select name="unidade" class="sel">
+    <option value="">Todas as unidades</option>
+    {% for u in units %}
+      <option value="{{ u }}" {{ 'selected' if u==unidade }}>Unidade {{ u }}</option>
+    {% endfor %}
+  </select>
+  <button class="btn" type="submit">Filtrar</button>
+  {% if q or unidade %}<a class="btn" href="{{ request.path }}">limpar</a>{% endif %}
+</form>
+{% if unidade %}<p class="muted">Filtrando pela unidade <b>{{ unidade }}</b>.</p>{% endif %}
+
+{% if view=='removed' %}
+<p class="muted">Estes MACs saíram da allow-list (troca de aparelho/remoção), mas
+os dados foram preservados. Recadastre o MAC para reativar, ou copie os dados
+para um MAC novo na tela do cliente.</p>
+{% endif %}
+
+<p class="muted">{{ rows|length }} cliente(s).</p>
+<table>
+  <thead>
+    <tr>
+      <th>Nome</th><th>Setor</th><th>Unidade</th><th>Função</th>
+      <th>Líder</th><th>Chamado</th><th>Aparelho</th><th>MAC</th>
+      <th>Sites</th><th>Status</th>
+      <th>{{ 'Removido em' if view=='removed' else 'Voltou em' }}</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr class="{{ 'rowdim' if not r.active }}">
+      <td>{% if r.vip %}<span class="pill vip" title="VIP / Diretoria">★</span> {% endif %}{{ r.nome or '—' }}</td>
+      <td>{{ r.setor }}</td>
+      <td>{{ r.unidade }}</td>
+      <td>{{ r.funcao }}</td>
+      <td>{{ r.lider }}</td>
+      <td>{{ r.chamado }}</td>
+      <td title="{{ r.hostname }}">{{ r.device_name or r.hostname or '—' }}<br>
+          <span class="muted" style="font-size:12px">{{ r.oui }}</span></td>
+      <td class="mono">{{ r.mac }}</td>
+      <td class="muted" style="font-size:12px">{{ r.sites or '—' }}</td>
+      <td>
+        {% if r.active %}
+          <span class="pill {{ 'online' if r.online else 'idle' }}">{{ 'online' if r.online else 'offline' }}</span>
+        {% else %}<span class="pill never">removido</span>{% endif %}
+        {% if r.blocked %}<span class="pill blocked">🚫</span>{% endif %}
+        {% if r.has_info and not r.termo %}<span class="pill stale" title="Termo não assinado">📄!</span>{% endif %}
+      </td>
+      <td class="muted">
+        {% set evt = ev_ts.get(r.mac, {}) %}
+        {% if view=='removed' %}{{ evt.removido|ts if evt.removido else '—' }}
+        {% else %}{{ evt.voltou|ts if evt.voltou else '—' }}{% endif %}
+      </td>
+      <td><a class="chip" href="{{ url_for('cliente', mac=r.mac) }}">editar</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endblock %}

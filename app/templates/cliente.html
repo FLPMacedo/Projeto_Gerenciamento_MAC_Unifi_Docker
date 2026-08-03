@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block content %}
+<a href="{{ url_for('clientes') }}" class="back">← clientes</a>
+{% if editing_by %}
+<div class="flash warn">⚠️ Este cliente está sendo editado por <b>{{ editing_by }}</b>
+em outra instância. Cuidado para não sobrescrever as alterações dele.</div>
+{% endif %}
+<h1>Cliente · <span class="mono">{{ mac }}</span>
+  {% if dev and dev.active %}<span class="pill online">ativo</span>
+  {% elif dev %}<span class="pill never">removido</span>{% endif %}
+  {% if dev and dev.blocked %}<span class="pill blocked">🚫 bloqueado</span>{% endif %}
+  {% if info.vip %}<span class="pill vip">★ VIP / Diretoria</span>{% endif %}
+  {% if info.termo %}<span class="pill recent">📄 Termo OK</span>
+  {% elif info %}<span class="pill stale">📄 sem termo</span>{% endif %}
+</h1>
+
+{% if dev %}
+<div class="chartbox" style="margin-bottom:14px">
+  <h2 class="sec">Informações do aparelho (UniFi)</h2>
+  <div class="kv">
+    <div><span>Nome do aparelho</span><b>{{ dev.device_name or '—' }}</b></div>
+    <div><span>Hostname</span><b>{{ dev.hostname or '—' }}</b></div>
+    <div><span>Fabricante</span><b>{{ dev.oui or '—' }}</b></div>
+    <div><span>MAC</span><b class="mono">{{ dev.mac }}</b></div>
+    <div><span>Último acesso</span><b>{{ dev.last_seen|ts }}</b></div>
+    <div><span>Visto pela 1ª vez</span><b>{{ dev.first_seen|ts }}</b></div>
+    <div><span>Online agora</span><b>{{ 'Sim' if dev.online else 'Não' }}</b></div>
+    <div><span>Bloqueado</span><b>{{ 'Sim 🚫' if dev.blocked else 'Não' }}</b></div>
+  </div>
+  <h2 class="sec" style="margin-top:12px">Cadastrado nos sites</h2>
+  <div class="statusline">
+    {% for s in dev.sites %}
+      <span class="pill {{ 'blocked' if s.blocked else ('online' if s.in_list else 'never') }}">
+        {{ s.site_desc }} {{ '🚫' if s.blocked else ('✓' if s.in_list else '✕') }}</span>
+    {% endfor %}
+  </div>
+</div>
+{% else %}
+<div class="flash warn">Ainda não temos dados deste MAC no histórico (rode uma coleta).</div>
+{% endif %}
+
+<div class="chartbox">
+  <h2 class="sec">Cadastro do cliente</h2>
+  <form method="post" class="cadform" style="max-width:none">
+    <div class="formgrid">
+      <label>Nome<input name="nome" value="{{ info.nome or (dev.device_name if dev else '') }}"></label>
+      <label>Setor<input name="setor" value="{{ info.setor or '' }}"></label>
+      <label>Função<input name="funcao" value="{{ info.funcao or '' }}"></label>
+      <label>Líder<input name="lider" value="{{ info.lider or '' }}"></label>
+      <label>Gestor que autorizou<input name="gestor_autorizou" value="{{ info.gestor_autorizou or '' }}"></label>
+      <label>Chamado<input name="chamado" value="{{ info.chamado or '' }}"></label>
+    </div>
+    <div class="unitsblock">
+      <span class="lbl">Unidade(s) onde fica</span>
+      <div class="unitgrid">
+        {% for u in units %}
+        <label class="unitchk">
+          <input type="checkbox" name="unidade" value="{{ u }}"
+                 {{ 'checked' if u in selected_units }}> {{ u }}
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    <label>Observações<textarea name="notes" rows="2">{{ info.notes or '' }}</textarea></label>
+    <label class="vipcheck" style="background:#0f2a3a;border-color:#1c4d68">
+      <input type="checkbox" name="termo" {{ 'checked' if info.termo }}>
+      <span style="color:#9fc7e6">📄 <b>Termo assinado/entregue</b> (marque se o
+      termo de uso foi assinado).</span>
+    </label>
+    <label class="vipcheck">
+      <input type="checkbox" name="vip" {{ 'checked' if info.vip }}>
+      <span>★ <b>MAC prioritário (VIP / Diretoria)</b> — não deve ser apagado;
+      gera alerta se sair da rede.</span>
+    </label>
+    <button class="btn primary" type="submit">Salvar cadastro</button>
+    {% if info.updated_at %}<span class="muted">atualizado em {{ info.updated_at|ts }}</span>{% endif %}
+  </form>
+</div>
+
+<div class="chartbox" style="margin-top:14px">
+  <h2 class="sec">Troca de aparelho (este MAC → novo)</h2>
+  <p class="muted">Trocou de celular? Informe o MAC novo: o cadastro (nome, setor,
+  unidade, VIP, etc.) é <b>transferido</b> para ele e a ação fica no log como
+  <b>troca</b>.</p>
+  <form method="post" class="cadform" style="max-width:none"
+        onsubmit="return confirm('Confirmar troca deste MAC pelo novo? O cadastro será transferido.');">
+    <input type="hidden" name="action" value="troca">
+    <label>Novo MAC
+      <input name="new_mac" placeholder="aa:bb:cc:dd:ee:ff" required
+             pattern="[0-9A-Fa-f:.\- ]{12,17}">
+    </label>
+    <label class="vipcheck" style="background:#0f2a3a;border-color:#1c4d68">
+      <input type="checkbox" name="apply_net">
+      <span style="color:#9fc7e6">Aplicar na rede agora (remove o antigo e adiciona
+      o novo na allow-list do site selecionado)</span>
+    </label>
+    <label>Site (só se "aplicar na rede")
+      <select name="troca_target" class="sel">
+        <option value="">— escolher site —</option>
+        {% for s in mobile_sites %}
+          <option value="{{ s.site_id }}:{{ s.wlan_id }}">{{ s.site_desc }} — {{ s.total }}/{{ s.cap }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button class="btn primary" type="submit">Registrar troca</button>
+  </form>
+</div>
+
+<div class="chartbox" style="margin-top:14px">
+  <h2 class="sec">Auditoria / histórico deste MAC</h2>
+  {% if events %}
+  <table>
+    <thead><tr><th>Quando</th><th>Evento</th><th>Site</th><th>Detalhe</th></tr></thead>
+    <tbody>
+      {% for e in events %}
+      <tr>
+        <td>{{ e.ts|ts }}</td>
+        <td><span class="pill ev-{{ e.event }}">{{ event_label.get(e.event, e.event) }}</span></td>
+        <td class="muted">{{ e.site_desc or '—' }}</td>
+        <td class="muted">{{ e.detail }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">Nenhum evento registrado ainda. A auditoria passa a registrar
+  remoções, retornos e bloqueios a partir das próximas coletas.</p>
+  {% endif %}
+</div>
+
+{% if removed %}
+<div class="chartbox" style="margin-top:14px">
+  <h2 class="sec">Troca de aparelho — copiar dados de um usuário removido</h2>
+  <form method="post" class="searchbar">
+    <input type="hidden" name="action" value="copy">
+    <select name="from_mac" class="sel">
+      <option value="">— selecione um usuário removido —</option>
+      {% for r in removed %}
+        <option value="{{ r.mac }}">{{ r.nome or r.device_name or r.mac }}
+          {% if r.setor %}· {{ r.setor }}{% endif %} ({{ r.mac }})</option>
+      {% endfor %}
+    </select>
+    <button class="btn" type="submit">Copiar dados para este MAC</button>
+  </form>
+  <p class="muted">Útil quando a pessoa trocou de celular: traz nome/setor/unidade/etc. do cadastro antigo.</p>
+</div>
+{% endif %}
+{% endblock %}

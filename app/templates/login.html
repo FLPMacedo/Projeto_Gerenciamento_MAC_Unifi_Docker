@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Entrar · Gestão MAC</title>
+  <link rel="icon" href="{{ url_for('static', filename='unifi.ico') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="loginwrap">
+    <div class="loginbox">
+      <img class="logo logo-unifi" src="{{ url_for('static', filename='logo_unifi.jpg') }}" alt="UniFi">
+      <div class="brand" style="font-size:20px;margin-bottom:2px">Gestão MAC Mobile</div>
+      <p class="muted" style="margin:0 0 8px">Entre com sua conta do <b>UniFi</b>.</p>
+      {% with msgs = get_flashed_messages(with_categories=true) %}
+        {% for cat, msg in msgs %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
+      {% endwith %}
+
+      <form method="post" action="{{ url_for('login', next=request.args.get('next','')) }}"
+            class="cadform" style="max-width:none">
+        <label>Usuário UniFi
+          <input name="username" value="{{ user_saved or '' }}" autofocus required>
+        </label>
+        <label>Senha UniFi
+          <input name="password" type="password" required>
+        </label>
+        <details>
+          <summary class="muted" style="cursor:pointer;font-size:13px">Avançado (servidor / banco)</summary>
+          <label style="margin-top:8px">Host do controller
+            <input name="host" value="{{ host }}" placeholder="https://IP-DO-CONTROLLER">
+          </label>
+          <label style="margin-top:8px">Pasta do banco (rede)
+            <input name="db_folder" value="{{ db_folder }}"
+                   placeholder="\\SERVIDOR\Compartilhada\GestaoMAC\data">
+          </label>
+          <span class="muted" style="font-size:12px">Aponte para a pasta de rede
+          compartilhada para usar o mesmo banco entre vários PCs.</span>
+        </details>
+        <button class="btn primary" type="submit">Entrar</button>
+      </form>
+      <p class="muted" style="font-size:12px;margin-top:10px">
+        🔒 O acesso é validado direto no controller UniFi — só contas autorizadas entram.
+      </p>
+      <p class="muted" style="font-size:11px;text-align:center;margin:6px 0 0">UniFi {{ app_version }}{% if brand %} · {{ brand }}{% endif %}</p>
+    </div>
+  </div>
+  <script>
+  // heartbeat na tela de login -> mantem o app vivo enquanto ninguem logou ainda
+  (function(){
+    function ping(){ fetch("{{ url_for('api_ping') }}",{method:"POST"}).catch(function(){}); }
+    ping(); setInterval(ping, 25000);
+  })();
+  </script>
+</body>
+</html>

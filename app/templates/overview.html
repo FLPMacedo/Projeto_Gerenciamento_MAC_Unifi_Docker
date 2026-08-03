@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+{% block content %}
+<script>window.AUTO_REFRESH=true;</script>
+{% set t = data.totals %}
+{% set d = data.dist %}
+
+<div class="topbar">
+  <div><a href="{{ url_for('index') }}" class="back">← sites</a>
+  <h1>Visão geral · todos os sites</h1></div>
+  <form method="get" class="daysform">
+    Sem conexão há mais de
+    <input type="number" name="days" value="{{ days }}" min="1" max="365" style="width:70px">
+    dias
+    <button class="btn" type="submit">Aplicar</button>
+    <a class="btn" href="?days={{ days }}&refresh=1" title="Recarregar do controller">↻</a>
+  </form>
+</div>
+
+<div class="cards">
+  <div class="metric"><span class="big">{{ t.total }}</span><span>MACs cadastrados (total)</span></div>
+  <div class="metric good"><span class="big">{{ t.in_use }}</span><span>em uso (≤{{ days }}d)</span></div>
+  <div class="metric warn"><span class="big">{{ t.over_x }}</span><span>parados &gt;{{ days }}d</span></div>
+  <div class="metric warn"><span class="big">{{ t.never }}</span><span>nunca conectou (liberável)</span></div>
+  <div class="metric danger"><span class="big">{{ t.reclaimable }}</span><span>disponíveis (&gt;{{ days }}d sem logar)</span></div>
+  <div class="metric"><span class="big">{{ t.online }}</span><span>online agora</span></div>
+  <div class="metric"><span class="big">{{ t.blocked }}</span><span>🚫 bloqueados</span></div>
+</div>
+
+<h2 class="sec">Prioridade de limpeza (remover do mais antigo primeiro)</h2>
+<div class="cards">
+  <div class="metric warn"><span class="big">{{ t.d50 }}</span><span>parados &gt; 50 dias</span></div>
+  <div class="metric danger"><span class="big">{{ t.d100 }}</span><span>parados &gt; 100 dias</span></div>
+  <div class="metric"><span class="big">{{ t.never }}</span><span>nunca conectaram</span></div>
+</div>
+
+{% set tot = t.total or 1 %}
+{% set a = (t.in_use / tot * 100) %}
+{% set b = a + (t.over_x / tot * 100) %}
+<div class="charts">
+  <div class="chartbox">
+    <h2 class="sec">Uso × liberável</h2>
+    <div class="donutwrap">
+      <div class="donut" style="background:conic-gradient(var(--green) 0 {{ a }}%, var(--amber) {{ a }}% {{ b }}%, var(--red) {{ b }}% 100%)">
+        <div class="hole"><b>{{ t.total }}</b><span>MACs</span></div>
+      </div>
+      <div class="legend">
+        <span><i style="background:var(--green)"></i> Em uso ≤{{ days }}d — <b>{{ t.in_use }}</b></span>
+        <span><i style="background:var(--amber)"></i> Sem conexão &gt;{{ days }}d — <b>{{ t.over_x }}</b></span>
+        <span><i style="background:var(--red)"></i> Nunca conectaram — <b>{{ t.never }}</b></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="chartbox grow">
+    <h2 class="sec">Distribuição por inatividade</h2>
+    {% set items = [('online','online','Online',d.online),('idle','ate30','≤30d',d.ate30),('stale','3150','31–50d',d['31-50']),('abandoned','51100','51–100d',d['51-100']),('never','d100','>100d',d['>100']),('never','never','Nunca',d.never)] %}
+    <div class="stack">
+      {% for cls, key, lbl, val in items %}
+        {% if val %}<i class="{{ cls }}" style="width:{{ (val/tot*100) }}%" title="{{ lbl }}: {{ val }}"></i>{% endif %}
+      {% endfor %}
+    </div>
+    <div class="stacklegend">
+      {% for cls, key, lbl, val in items %}
+        <span class="pill {{ cls }}">{{ lbl }}: <b>{{ val }}</b></span>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<h2 class="sec">Vagas liberáveis por site</h2>
+{% set maxr = (data.sites|map(attribute='reclaimable')|max) or 1 %}
+<div class="hbars">
+  {% for s in data.sites if s.wlan_id %}
+  <div class="hbar">
+    <span class="lbl">{{ s.site_desc }}</span>
+    <div class="track"><i style="width:{{ (s.reclaimable/maxr*100) }}%"></i></div>
+    <span class="val">{{ s.reclaimable }}</span>
+  </div>
+  {% endfor %}
+</div>
+
+<h2 class="sec">Por site (detalhe) — ordenado por mais antigos (&gt;100d)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Site</th><th>Ocupação</th>
+      <th>&gt;50d</th><th>&gt;100d</th><th>Nunca</th>
+      <th>Liberáveis</th><th>Livres</th><th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for s in data.sites|sort(attribute='d100', reverse=true) %}
+    <tr>
+      <td>{{ s.site_desc }}</td>
+      <td>
+        {% if s.wlan_id %}
+        <div class="minibar {{ 'full' if s.is_full }}">
+          <i style="width: {{ s.pct }}%"></i><span>{{ s.total }}/{{ s.cap }}</span>
+        </div>
+        {% else %}<span class="muted">sem WLAN mobile</span>{% endif %}
+      </td>
+      <td>{{ s.d50 }}</td>
+      <td><b class="{{ 'hot' if s.d100 }}">{{ s.d100 }}</b></td>
+      <td>{{ s.never }}</td>
+      <td><b class="{{ 'hot' if s.reclaimable }}">{{ s.reclaimable }}</b></td>
+      <td>{{ s.free }}</td>
+      <td>{% if s.wlan_id %}
+        <a class="chip" href="{{ url_for('dashboard', site_id=s.site_id, wlan=s.wlan_id, filter='unused') }}">abrir</a>
+      {% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted">
+  Histórico mesclado em SQLite: <b>{{ data.collections }}</b> coleta(s)
+  {% if data.latest_ts %}· última em {{ data.latest_ts|ts }}{% endif %}.
+  Regra à prova de férias: um MAC só fica disponível após <b>{{ days }} dias</b>
+  sem logar. Use ↻ para coletar agora.
+</p>
+{% endblock %}

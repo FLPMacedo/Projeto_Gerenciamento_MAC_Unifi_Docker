@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>➕ Adicionar MAC</h1>
+<p class="muted">Adiciona <b>1 MAC</b> à allow-list de um site. Só é permitido se
+houver <b>folga</b> (menos de 512). A ação é registrada na auditoria com o seu usuário.</p>
+
+<form method="post" class="cadform">
+  <label>Site
+    <select name="target" class="sel" required>
+      <option value="">— selecione o site —</option>
+      {% for s in sites %}
+        <option value="{{ s.site_id }}:{{ s.wlan_id }}" {{ 'disabled' if s.total >= s.cap }}>
+          {{ s.site_desc }} — {{ s.total }}/{{ s.cap }}{{ ' (LOTADO)' if s.total >= s.cap }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Endereço MAC
+    <input name="mac" value="{{ mac }}" placeholder="aa:bb:cc:dd:ee:ff" required
+           pattern="[0-9A-Fa-f:.\- ]{12,17}">
+  </label>
+  <label>Nome / dono (opcional)
+    <input name="nome" value="{{ nome }}" placeholder="Ex.: Maria - Financeiro">
+  </label>
+  <button class="btn primary" type="submit">Adicionar</button>
+</form>
+<p class="muted" style="margin-top:10px">Sites lotados (512/512) ficam
+desabilitados — use o módulo <b>Remover</b> para liberar vaga antes.</p>
+{% endblock %}

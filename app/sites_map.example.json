@@ -1,0 +1,8 @@
+{
+  "_comentario": "Copie para sites_map.json (local, fora do git) e preencha com o de-para REAL nome-da-aba -> numero-da-unidade do seu ambiente.",
+  "sheet_unit": {
+    "exemplo unidade a": "101",
+    "exemplo unidade b": "102"
+  },
+  "valid_units": ["101", "102", "103", "104", "105"]
+}

@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Segredos / dados locais (NUNCA versionar) ---
+.env
+.env.local
+*.key
+secret.key
+creds.enc
+*.enc
+# de-para unidade<->site: identidade da empresa
+sites_map.json
+# logo da empresa: fica local / em volume
+static/logo_brand.*
+app/static/logo_brand.*
+
+# --- Dados ---
+*.db
+*.sqlite
+*.sqlite3
+data/
+backups/
+logs/
+*.log
+# planilhas contem nomes e MACs (dados pessoais)
+*.xlsx
+
+# --- Artefatos da versao desktop (ficam no repo antigo) ---
+dist/
+build/
+pacote/
+*.spec
+*.exe
+*.zip
+
+# --- Copia da instalacao de producao usada como fonte da migracao ---
+# (contem o history.db real, o .exe e logs — nao entra no repo)
+_Projeto_Gerenciamento_MAC_Unifi/
+
+# --- Editor / SO ---
+.claude/settings.local.json
+.DS_Store
+Thumbs.db

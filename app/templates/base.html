@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Gestão MAC Mobile · UniFi{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', filename='unifi.ico') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <a class="brand" href="{{ url_for('index') }}">
+      <img class="logo logo-unifi" src="{{ url_for('static', filename='logo_unifi.jpg') }}" alt="UniFi">
+      <span>Gestão MAC Mobile</span>
+    </a>
+    <nav class="topnav">
+      <a href="{{ url_for('index') }}">Sites</a>
+      <a href="{{ url_for('overview') }}">Visão geral</a>
+      <a href="{{ url_for('clientes') }}">Clientes</a>
+      <a href="{{ url_for('adicionar') }}">➕ Adicionar</a>
+      <a href="{{ url_for('remover') }}">➖ Remover</a>
+      <a href="{{ url_for('auditoria') }}">Auditoria</a>
+      <a href="{{ url_for('backup_page') }}">⬇ Backup</a>
+      <a class="cta" href="{{ url_for('refresh', next=request.path) }}">↻ Atualizar status</a>
+      <span class="conn" title="Usuários conectados agora">👥 <b id="conncount">{{ connected }}</b></span>
+      <a href="{{ url_for('config') }}" title="Configurar UniFi">⚙</a>
+      <a href="{{ url_for('logout') }}" title="Sair">⏻ Sair</a>
+    </nav>
+    {% if brand_logo %}
+    <img class="logo logo-brand" src="{{ url_for('static', filename=brand_logo) }}" alt="logo">
+    {% endif %}
+  </header>
+  <div class="readonly">🔒 Monitoramento + ações manuais <b>unitárias</b> (1 MAC por vez), com confirmação e registro de quem fez. Sem alterações em massa.</div>
+  {% if vip_alert %}
+  <a class="vipalert" href="{{ url_for('clientes_removidos', vip=1) }}">
+    🚨 ALERTA: {{ vip_alert|length }} MAC(s) <b>VIP/Diretoria</b> fora da rede —
+    clique para ver (não deveriam ter sido removidos).
+  </a>
+  {% endif %}
+  <main>
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% for cat, msg in msgs %}
+        <div class="flash {{ cat }}">{{ msg }}</div>
+      {% endfor %}
+    {% endwith %}
+    {% block content %}{% endblock %}
+    <footer class="rodape">
+      Gestão MAC Mobile · UniFi <b>{{ app_version }}</b>{% if brand %} · {{ brand }}{% endif %}
+    </footer>
+  </main>
+  <script>
+  (function(){
+    // heartbeat: mantem a sessao viva e atualiza o nº de conectados
+    function ping(){
+      fetch("{{ url_for('api_ping') }}", {method:"POST"})
+        .then(r=>r.json()).then(d=>{
+          var el=document.getElementById("conncount");
+          if(el && d.connected!=null) el.textContent=d.connected;
+        }).catch(function(){});
+    }
+    ping();
+    setInterval(ping, 25000);
+    // auto-atualizacao (so em telas marcadas) a cada 60s, sem atrapalhar quem digita
+    if(window.AUTO_REFRESH){
+      setInterval(function(){
+        var a=document.activeElement;
+        if(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+        location.reload();
+      }, 60000);
+    }
+    // mascara de MAC: completa os ":" a cada 2 digitos enquanto digita
+    function fmtMac(v){
+      var hex=(v||"").replace(/[^0-9a-fA-F]/g,"").slice(0,12);
+      return (hex.match(/.{1,2}/g)||[]).join(":");
+    }
+    document.addEventListener("input", function(e){
+      var t=e.target;
+      if(t && t.tagName==="INPUT" && (t.name==="mac" || t.name==="new_mac")){
+        var atEnd = t.selectionStart===t.value.length;
+        t.value = fmtMac(t.value);
+        if(atEnd){ try{ t.setSelectionRange(t.value.length, t.value.length); }catch(_){} }
+      }
+    });
+  })();
+  </script>
+</body>
+</html>

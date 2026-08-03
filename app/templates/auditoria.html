@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block content %}
+<script>window.AUTO_REFRESH=true;</script>
+
+<div class="topbar">
+  <h1>Auditoria</h1>
+  <div class="filters">
+    <a class="chip {{ 'active' if fonte!='unifi' }}" href="{{ url_for('auditoria') }}">Sistema</a>
+    <a class="chip {{ 'active' if fonte=='unifi' }}" href="{{ url_for('auditoria', fonte='unifi') }}">UniFi (nativo)</a>
+  </div>
+</div>
+
+{% if fonte=='unifi' %}
+<p class="muted">Espelho do <b>log nativo de atividade da UniFi</b> (preservado no
+nosso banco mesmo após a UniFi apagar). Total: <b>{{ total }}</b> registro(s).</p>
+<form method="get" class="searchbar">
+  <input type="hidden" name="fonte" value="unifi">
+  <input type="text" name="q" value="{{ q }}" placeholder="Buscar por quem, mensagem, site...">
+  <button class="btn" type="submit">Filtrar</button>
+  {% if q %}<a class="btn" href="{{ url_for('auditoria', fonte='unifi') }}">limpar</a>{% endif %}
+</form>
+<p class="muted">{{ rows|length }} registro(s) (mais recentes primeiro).</p>
+<table>
+  <thead><tr><th>Quando</th><th>Quem</th><th>Ação</th><th>Site</th><th>Mensagem</th></tr></thead>
+  <tbody>
+    {% for e in rows %}
+    <tr>
+      <td>{{ e.ts|ts }}</td>
+      <td>{{ e.actor or '—' }}</td>
+      <td class="muted">{{ e.key or e.operation or '' }}</td>
+      <td class="muted">{{ e.site_desc or '—' }}</td>
+      <td>{{ e.message or '' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% if not rows %}
+<p class="muted">Sem registros ainda — eles aparecem após a próxima coleta importar
+o log da UniFi.</p>
+{% endif %}
+
+{% else %}
+<p class="muted">Transições detectadas por nós (removido, voltou, bloqueio,
+troca, ações manuais). Total: <b>{{ total }}</b> evento(s).</p>
+<form method="get" class="searchbar">
+  <input type="text" name="q" value="{{ q }}" placeholder="Buscar por MAC ou site...">
+  <select name="event" class="sel">
+    <option value="">Todos os eventos</option>
+    {% for key, lbl in labels.items() %}
+      <option value="{{ key }}" {{ 'selected' if key==event }}>{{ lbl }}</option>
+    {% endfor %}
+  </select>
+  <button class="btn" type="submit">Filtrar</button>
+  {% if q or event %}<a class="btn" href="{{ url_for('auditoria') }}">limpar</a>{% endif %}
+  <a class="btn" href="{{ url_for('auditoria_csv', event=event, q=q) }}">⬇ Exportar CSV</a>
+</form>
+<p class="muted">{{ rows|length }} evento(s) exibido(s) (mais recentes primeiro).</p>
+<table>
+  <thead>
+    <tr><th>Quando</th><th>Evento</th><th>Site</th><th>MAC</th><th>Detalhe</th></tr>
+  </thead>
+  <tbody>
+    {% for e in rows %}
+    <tr>
+      <td>{{ e.ts|ts }}</td>
+      <td><span class="pill ev-{{ e.event }}">{{ labels.get(e.event, e.event) }}</span></td>
+      <td class="muted">{{ e.site_desc or '—' }}</td>
+      <td class="mono"><a href="{{ url_for('cliente', mac=e.mac) }}">{{ e.mac }}</a></td>
+      <td class="muted">{{ e.detail }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% if not rows %}
+<p class="muted">Sem eventos ainda.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

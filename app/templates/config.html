@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Configuração do acesso ao UniFi</h1>
+<p class="muted">As credenciais ficam <b>no banco local</b> (a senha é
+<b>criptografada</b>), nunca no código. Use uma conta <b>local</b> do controller.</p>
+
+<form method="post" class="cadform">
+  <label>Endereço do controller (host)
+    <input name="host" value="{{ cfg.host or '' }}" placeholder="https://IP-DO-CONTROLLER" required>
+  </label>
+  <label>Site padrão (id interno)
+    <input name="site" value="{{ cfg.site or 'default' }}" placeholder="default">
+  </label>
+  <label>Usuário UniFi
+    <input name="username" value="{{ cfg.username or '' }}" required>
+  </label>
+  <label>Senha UniFi
+    <input name="password" type="password"
+           placeholder="{{ '•••••• (deixe em branco para manter)' if has_pw else 'digite a senha' }}">
+  </label>
+  <label class="inline">
+    <input type="checkbox" name="verify" {{ 'checked' if cfg.verify }}>
+    Verificar certificado TLS (deixe desligado para o certificado autoassinado do Cloud Key)
+  </label>
+  <button class="btn primary" type="submit">Salvar e testar conexão</button>
+</form>
+
+{% if has_pw %}
+<p class="muted">Senha já configurada (criptografada). Digite uma nova só se quiser trocá-la.
+Depois disso você pode remover a senha do arquivo <code>.env</code>.</p>
+{% endif %}
+{% endblock %}

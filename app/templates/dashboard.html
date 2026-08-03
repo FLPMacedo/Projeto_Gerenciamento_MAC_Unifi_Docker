@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block content %}
+<script>window.AUTO_REFRESH=true;</script>
+
+<div class="topbar">
+  <div>
+    <a href="{{ url_for('index') }}" class="back">← sites</a>
+    <h1>{{ site_desc }}</h1>
+  </div>
+  <form method="get" class="site-switch">
+    <select name="site_id" onchange="location.href='/site/'+this.value">
+      {% for s in sites %}
+      <option value="{{ s.id }}" {{ 'selected' if s.id==site_id }}>{{ s.desc }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+{% if not inv %}
+  <div class="flash warn">Este site não possui WLAN mobile (com filtro de MAC).</div>
+{% else %}
+
+{% if mobiles|length > 1 %}
+<div class="wlanpick">
+  WLAN:
+  {% for w in mobiles %}
+    <a class="chip {{ 'active' if w._id==wlan._id }}"
+       href="{{ url_for('dashboard', site_id=site_id, wlan=w._id) }}">{{ w.name }}</a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% set s = inv.summary %}
+<div class="cards">
+  <div class="metric {{ 'danger' if s.is_full else ('warn' if s.free_slots < 30 else '') }}">
+    <span class="big">{{ s.total }}/{{ s.cap }}</span>
+    <span>vagas usadas {% if s.is_full %}(LOTADO){% endif %}</span>
+    <div class="bar"><i style="width: {{ (s.total / s.cap * 100)|round }}%"></i></div>
+  </div>
+  <div class="metric good"><span class="big">{{ s.in_use }}</span><span>em uso</span></div>
+  <div class="metric warn"><span class="big">{{ s.unused }}</span><span>sem uso (liberáveis)</span></div>
+  <div class="metric"><span class="big">{{ s.free_slots }}</span><span>vagas livres</span></div>
+</div>
+
+<div class="statusline">
+  {% for k, lbl in [('online','Online'),('recent','Ativo ≤7d'),('idle','Ocioso 8-30d'),('stale','Parado 31-90d'),('abandoned','Abandonado >90d'),('never','Nunca visto')] %}
+    <span class="pill {{ k }}">{{ lbl }}: <b>{{ s.counts[k] }}</b></span>
+  {% endfor %}
+</div>
+
+<div class="toolbar">
+  <div class="filters">
+    <a class="chip {{ 'active' if filt=='all' }}" href="?wlan={{ wlan._id }}&filter=all">Todos ({{ s.total }})</a>
+    <a class="chip {{ 'active' if filt=='unused' }}" href="?wlan={{ wlan._id }}&filter=unused">Sem uso ({{ s.unused }})</a>
+    <a class="chip {{ 'active' if filt=='d50' }}" href="?wlan={{ wlan._id }}&filter=d50">&gt;50d ({{ s.d50 }})</a>
+    <a class="chip {{ 'active' if filt=='d100' }}" href="?wlan={{ wlan._id }}&filter=d100">&gt;100d ({{ s.d100 }})</a>
+    <a class="chip {{ 'active' if filt=='online' }}" href="?wlan={{ wlan._id }}&filter=online">Online ({{ s.counts.online }})</a>
+    <a class="chip {{ 'active' if filt=='blocked' }}" href="?wlan={{ wlan._id }}&filter=blocked">🚫 Bloqueados ({{ s.blocked }})</a>
+  </div>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('export_csv', site_id=site_id, wlan_id=wlan._id) }}">⬇ Exportar CSV</a>
+    <a class="btn" href="{{ url_for('refresh', next=request.path) }}">↻ Atualizar status</a>
+  </div>
+</div>
+
+<table>
+  <thead>
+    <tr>
+      <th>MAC</th><th>Nome / dono</th><th>Fabricante</th>
+      <th>Status</th><th>Parado (dias)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in rows %}
+    <tr class="{{ 'rowdim' if r.unused }}">
+      <td class="mono"><a href="{{ url_for('cliente', mac=r.mac) }}" title="ficha do cliente">{{ r.mac }}</a></td>
+      <td>{{ r.name or '—' }}</td>
+      <td class="muted">{{ r.oui }}</td>
+      <td>
+        <span class="pill {{ r.status }}">{{ r.status_label }}</span>
+        {% if r.blocked %}<span class="pill blocked">🚫 Bloqueado</span>{% endif %}
+        {% if r.vip %}<span class="pill vip">★ VIP — não remover</span>{% endif %}
+      </td>
+      <td>{{ r.days_idle if r.days_idle is not none else '—' }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p class="muted">Os MACs marcados como "sem uso" são <b>sugestões</b> para uma
+pessoa avaliar e remover manualmente na UniFi. Este sistema não remove nada.</p>
+{% endif %}
+{% endblock %}

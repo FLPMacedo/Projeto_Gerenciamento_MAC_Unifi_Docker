@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>➖ Remover MAC</h1>
+<p class="muted">Remove <b>1 MAC</b> da allow-list de um site (libera 1 vaga).
+MACs <b>VIP/Diretoria</b> não podem ser removidos aqui. A ação é registrada na auditoria.</p>
+
+<form method="post" class="cadform"
+      onsubmit="return confirm('Remover este MAC da allow-list do site? Ele perde acesso à rede mobile.');">
+  <label>Site
+    <select name="target" class="sel" required>
+      <option value="">— selecione o site —</option>
+      {% for s in sites %}
+        <option value="{{ s.site_id }}:{{ s.wlan_id }}" {{ 'selected' if target==(s.site_id ~ ':' ~ s.wlan_id) }}>
+          {{ s.site_desc }} — {{ s.total }}/{{ s.cap }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Endereço MAC
+    <input name="mac" value="{{ mac }}" placeholder="aa:bb:cc:dd:ee:ff" required
+           pattern="[0-9A-Fa-f:.\- ]{12,17}">
+  </label>
+  <label class="vipcheck" style="background:#241016;border-color:#6b2620">
+    <input type="checkbox" name="confirm" value="1" required>
+    <span style="color:#f0928a">Confirmo a remoção deste MAC.</span>
+  </label>
+  <button class="btn danger" type="submit">Remover</button>
+</form>
+{% endblock %}
