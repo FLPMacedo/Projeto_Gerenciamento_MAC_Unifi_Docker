@@ -86,8 +86,21 @@ docker compose exec web python /app/scripts/migrate_sqlite_to_pg.py \
     --sqlite /tmp/history.db --reset
 ```
 
-Migra as 10 tabelas de dados integralmente, preserva as chaves primárias,
-reposiciona as sequências e confere a contagem de cada tabela ao final.
+Migra as 10 tabelas integralmente (557.742 linhas na base atual), preserva as
+chaves primárias, reposiciona as sequências, transporta o lease da coleta e
+confere a contagem de cada tabela ao final.
+
+**Duas chaves de `settings` ficam de fora por padrão**, por higiene e não por
+espaço:
+
+| Chave | Por quê |
+|---|---|
+| `unifi_password_enc` | senha cifrada com a `secret.key` local de cada máquina. Como essa chave não vai para o servidor (o modelo agora é conta de serviço), seria texto cifrado que ninguém consegue abrir. |
+| `admin_hash` | hash scrypt do admin da v1, obsoleto desde que o login passou a ser validado no controller. |
+
+Use `--incluir-segredos` para trazê-las mesmo assim. As outras 8 chaves vão
+normalmente — inclusive `unifi_host` e `unifi_site`, que servem de referência
+para preencher as variáveis do stack.
 
 ---
 

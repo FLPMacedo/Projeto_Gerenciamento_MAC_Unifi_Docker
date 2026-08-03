@@ -87,6 +87,21 @@ IDENTITY = {"collections": "id", "events": "id"}
 # Estado efemero: expira sozinho por TTL (20s a 180s). Migrado por fidelidade.
 EFEMERAS = {"edit_locks", "active_sessions", "wlan_locks"}
 
+# Chaves de `settings` que NAO sao migradas por padrao.
+#
+# Nao e economia de espaco, e higiene: sao material de credencial que ficaria
+# parado num banco agora compartilhado, sem nenhuma utilidade.
+#   unifi_password_enc -> senha cifrada com a secret.key LOCAL de cada maquina.
+#                         Como a secret.key nao vai para o servidor (o modelo
+#                         agora e conta de servico via env/secret), isso seria
+#                         texto cifrado que ninguem consegue abrir.
+#   admin_hash         -> hash scrypt do admin da v1, documentado como obsoleto
+#                         desde que o login passou a ser validado no controller.
+#
+# As demais chaves vao normalmente -- inclusive unifi_host/unifi_site, que
+# servem de referencia para preencher as variaveis do stack.
+SEGREDOS_MORTOS = {"unifi_password_enc", "admin_hash"}
+
 
 def contar_sqlite(sq: sqlite3.Connection) -> dict[str, int]:
     out = {}
@@ -103,7 +118,7 @@ def contar_pg(conn) -> dict[str, int]:
             for t in TABELAS}
 
 
-def _linhas(sq: sqlite3.Connection, tabela: str):
+def _linhas(sq: sqlite3.Connection, tabela: str, incluir_segredos: bool = False):
     """Le a tabela do SQLite normalizando NULL em coluna NOT NULL."""
     cols = COLUNAS[tabela]
     zeros = ZERO_SE_NULO.get(tabela, set())
@@ -114,12 +129,15 @@ def _linhas(sq: sqlite3.Connection, tabela: str):
 
     sel = ", ".join(c if c in disponiveis else "NULL" for c in cols)
     for row in sq.execute(f"SELECT {sel} FROM {tabela}"):
+        if (tabela == "settings" and not incluir_segredos
+                and row[0] in SEGREDOS_MORTOS):
+            continue
         yield tuple(
             (0 if (v is None and c in zeros) else v)
             for c, v in zip(cols, row))
 
 
-def migrar_tabela(sq, conn, tabela: str) -> int:
+def migrar_tabela(sq, conn, tabela: str, incluir_segredos: bool = False) -> int:
     cols = COLUNAS[tabela]
     lista = ", ".join(f'"{c}"' for c in cols)
     override = " OVERRIDING SYSTEM VALUE" if tabela in IDENTITY else ""
@@ -128,10 +146,33 @@ def migrar_tabela(sq, conn, tabela: str) -> int:
         with cur.copy(
             f'COPY {tabela} ({lista}){override} FROM STDIN'
         ) as copy:
-            for linha in _linhas(sq, tabela):
+            for linha in _linhas(sq, tabela, incluir_segredos):
                 copy.write_row(linha)
                 total += 1
     return total
+
+
+def migrar_lease(sq, conn) -> None:
+    """Leva settings['last_collect_ts'] para a tabela collect_lease.
+
+    O lease trocou de lugar na migracao (era uma linha TEXT em settings, virou
+    coluna BIGINT). Sem este passo o destino comecaria com last_ts=0 e a
+    primeira coleta dispararia na hora, ignorando a janela que ja estava em
+    curso na instalacao antiga.
+    """
+    linhas = dict(sq.execute(
+        "SELECT key, value FROM settings "
+        "WHERE key IN ('last_collect_ts','last_collect_by')").fetchall())
+    bruto = (linhas.get("last_collect_ts") or "0").strip()
+    ts = int(bruto) if bruto.isdigit() else 0
+    quem = linhas.get("last_collect_by") or ""
+    conn.execute(
+        "INSERT INTO collect_lease(id, last_ts, last_by) VALUES (1,%s,%s) "
+        "ON CONFLICT(id) DO UPDATE SET last_ts=excluded.last_ts, "
+        "last_by=excluded.last_by", (ts, quem))
+    conn.commit()
+    quando = (time.strftime("%d/%m/%Y %H:%M", time.localtime(ts)) if ts else "nunca")
+    print(f"  collect_lease -> ultima coleta {quando} por {quem or '?'}")
 
 
 def reposicionar_sequencias(conn) -> None:
@@ -156,6 +197,9 @@ def main() -> None:
                     help="LIMPA as tabelas no PostgreSQL antes de carregar")
     ap.add_argument("--dry-run", action="store_true",
                     help="so mostra o que seria migrado")
+    ap.add_argument("--incluir-segredos", action="store_true",
+                    help="migra tambem unifi_password_enc e admin_hash "
+                         "(credenciais mortas; por padrao ficam de fora)")
     args = ap.parse_args()
 
     if not os.path.exists(args.sqlite):
@@ -206,30 +250,41 @@ def main() -> None:
                 migrado[t] = 0
                 continue
             ti = time.time()
-            n = migrar_tabela(sq, conn, t)
+            n = migrar_tabela(sq, conn, t, args.incluir_segredos)
             migrado[t] = n
-            print(f"  {t:<18} {n:>10} linha(s)  {time.time() - ti:5.1f}s")
+            extra = ""
+            if t == "settings" and n < origem[t]:
+                extra = f"  ({origem[t] - n} credencial(is) morta(s) omitida(s))"
+            print(f"  {t:<18} {n:>10} linha(s)  {time.time() - ti:5.1f}s{extra}")
         conn.commit()
 
         reposicionar_sequencias(conn)
+        migrar_lease(sq, conn)
 
         print("\nCONFERENCIA")
         final = contar_pg(conn)
         print(f"{'tabela':<18} {'origem':>10} {'destino':>10}  ok")
-        print("-" * 44)
+        print("-" * 46)
         divergencias = []
         for t in TABELAS:
             orig = max(origem[t], 0)
             dest = final[t]
-            ok = orig == dest
+            # a unica diferenca aceitavel e settings menor pelas credenciais
+            # mortas que optamos por nao trazer
+            esperado = migrado[t] if origem[t] >= 0 else 0
+            ok = dest == esperado
+            nota = ""
+            if t == "settings" and dest < orig:
+                nota = "  (omissao intencional)"
             if not ok:
                 divergencias.append(t)
-            print(f"{t:<18} {orig:>10} {dest:>10}  {'sim' if ok else 'NAO'}")
+            print(f"{t:<18} {orig:>10} {dest:>10}  "
+                  f"{'sim' if ok else 'NAO'}{nota}")
 
         print(f"\nconcluido em {time.time() - t0:.1f}s")
         if divergencias:
             sys.exit(f"DIVERGENCIA em: {', '.join(divergencias)}")
-        print("Todas as contagens conferem.")
+        print("Todas as contagens conferem com o que foi enviado.")
 
     sq.close()
 
