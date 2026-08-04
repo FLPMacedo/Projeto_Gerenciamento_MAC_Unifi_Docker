@@ -98,7 +98,7 @@ def collect_once(client: UnifiClient, respect_lease: bool = True) -> bool:
 
     rows, ts = snapshot_all(client)
     novos = 0
-    vsync = {"atualizados": 0, "usados": 0, "expirados": 0}
+    vsync = {"atualizados": 0, "usados": 0}
     with db.connection() as conn:
         res = db.record_snapshot(conn, rows, ts)
         try:
@@ -111,10 +111,10 @@ def collect_once(client: UnifiClient, respect_lease: bool = True) -> bool:
             log.warning("sincronizacao de vouchers falhou: %s", exc)
 
     log.info("coleta #%s: %d linhas | %d removidos | %d eventos | "
-             "%d novos no log UniFi | vouchers %d ok/%d usados/%d expirados | %.1fs",
+             "%d novos no log UniFi | vouchers %d disponiveis/%d usados | %.1fs",
              res["collection_id"], res["rows"], res["marked_removed"],
              res["events"], novos, vsync["atualizados"], vsync["usados"],
-             vsync["expirados"], time.time() - t0)
+             time.time() - t0)
     return True
 
 
@@ -127,7 +127,7 @@ def sincroniza_vouchers(client: UnifiClient, conn) -> dict:
     sites = conn.execute(
         "SELECT DISTINCT site_id FROM voucher_grants "
         "WHERE revogado_em IS NULL").fetchall()
-    total = {"atualizados": 0, "usados": 0, "expirados": 0}
+    total = {"atualizados": 0, "usados": 0}
     for s in sites:
         try:
             vs = client.get_vouchers(s["site_id"])
@@ -137,7 +137,6 @@ def sincroniza_vouchers(client: UnifiClient, conn) -> dict:
         r = db.sync_voucher_status(conn, s["site_id"], vs)
         total["atualizados"] += r["atualizados"]
         total["usados"] += r["usados"]
-        total["expirados"] += r["expirados"]
     return total
 
 

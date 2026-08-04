@@ -1129,8 +1129,8 @@ def vouchers_sincronizar():
     except Exception as exc:                          # noqa: BLE001
         flash(f"Falha ao sincronizar: {str(exc)[:160]}", "err")
         return redirect(url_for("vouchers"))
-    flash(f"Situação atualizada: {r['atualizados']} disponível(is), "
-          f"{r['usados']} usado(s), {r['expirados']} expirado(s).", "ok")
+    flash(f"Situação atualizada: {r['atualizados']} disponível(is) e "
+          f"{r['usados']} já usado(s).", "ok")
     return redirect(request.form.get("next") or url_for("vouchers"))
 
 
