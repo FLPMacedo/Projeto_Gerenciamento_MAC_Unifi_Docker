@@ -857,9 +857,17 @@ VOUCHER_STATUS_LABEL = {
     "EXPIRED": "Expirado",
     "USADO": "Usado",
     "EXPIRADO": "Expirado",
+    # gravado por uma versao anterior, antes de sabermos distinguir os dois
+    "AUSENTE": "Fora do controller",
 }
 # Status que tiram o voucher da lista de entrega.
-VOUCHER_STATUS_MORTOS = ("USED_UPDATED", "EXPIRED", "USADO", "EXPIRADO")
+#
+# AUSENTE continua aqui por compatibilidade: bancos que sincronizaram com a
+# versao anterior tem linhas assim. Sem isso elas reapareceriam como
+# disponiveis logo apos a atualizacao, ate a proxima sincronizacao reclassifica-
+# las -- uma janela curta, mas em que alguem poderia imprimir codigo morto.
+VOUCHER_STATUS_MORTOS = ("USED_UPDATED", "EXPIRED", "USADO", "EXPIRADO",
+                         "AUSENTE")
 
 
 def sync_voucher_status(conn, site_id: str, vouchers: list[dict]) -> dict:
@@ -969,11 +977,11 @@ def voucher_stats(conn) -> dict:
                COUNT(*) FILTER (WHERE retirado_em IS NOT NULL) AS retirados,
                COUNT(*) FILTER (WHERE portal_user_id IS NOT NULL) AS atribuidos,
                COUNT(*) FILTER (WHERE used > 0) AS usados,
-               COUNT(*) FILTER (WHERE status IN ('EXPIRADO','EXPIRED')) AS expirados,
+               COUNT(*) FILTER (WHERE status IN ('EXPIRADO','EXPIRED','AUSENTE')) AS expirados,
                COUNT(*) FILTER (
                    WHERE revogado_em IS NULL AND used = 0
                      AND (status IS NULL OR status NOT IN
-                          ('USED_UPDATED','EXPIRED','USADO','EXPIRADO'))
+                          ('USED_UPDATED','EXPIRED','USADO','EXPIRADO','AUSENTE'))
                ) AS disponiveis,
                MAX(synced_at) AS ultima_sync
         FROM voucher_grants
