@@ -124,16 +124,45 @@ def trocar_senha():
     return render_template("portal_senha.html", u=u)
 
 
+def _meus_vouchers(conn, u, marcar_retirada=True):
+    """So os que ainda funcionam: entregar codigo ja usado nao serve para nada."""
+    vouchers = db.list_voucher_grants(
+        conn, portal_user_id=u["id"], somente_disponiveis=True, limit=300)
+    if marcar_retirada:
+        for v in vouchers:
+            if not v["retirado_em"]:
+                db.mark_voucher_retirado(conn, v["id"])
+                v["retirado_em"] = int(time.time())
+    return vouchers
+
+
 @bp.route("/")
 def meus():
     """Vouchers atribuidos a quem esta logado."""
     with db.connection() as conn:
         u = usuario_atual(conn)
-        vouchers = db.list_voucher_grants(
-            conn, portal_user_id=u["id"], somente_ativos=True, limit=200)
-        # a primeira visualizacao fica registrada (quem retirou e quando)
-        for v in vouchers:
-            if not v["retirado_em"]:
-                db.mark_voucher_retirado(conn, v["id"])
-                v["retirado_em"] = int(time.time())
+        vouchers = _meus_vouchers(conn, u)
     return render_template("portal_meus.html", u=u, vouchers=vouchers)
+
+
+@bp.route("/imprimir")
+def imprimir():
+    """Folha de cartoes, a MESMA do painel de gestao.
+
+    O botao daqui antes chamava window.print() na propria tela, o que mandava
+    para o papel o menu, a caixa de copiar e a tabela inteira. Reaproveitar o
+    template de impressao entrega a folha recortavel, com um cartao por
+    voucher.
+    """
+    with db.connection() as conn:
+        u = usuario_atual(conn)
+        # nao remarca a retirada: ela ja foi registrada ao abrir "Meus vouchers"
+        vouchers = _meus_vouchers(conn, u, marcar_retirada=False)
+        stats = db.voucher_stats(conn)
+    return render_template(
+        "vouchers_imprimir.html", rows=vouchers, agora=int(time.time()),
+        quota_label=lambda q: ("Ilimitado" if q == 0 else
+                               "Uso único" if q == 1 else f"{q} usos"),
+        status_label=db.VOUCHER_STATUS_LABEL,
+        todos=False, parcial=False, ultima_sync=stats["ultima_sync"],
+        titular=u["nome"] or u["username"])

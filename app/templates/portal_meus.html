@@ -10,7 +10,9 @@
 
 <div class="cards" style="margin-bottom:12px">
   <button class="btn primary" onclick="copiar()">📋 Copiar códigos</button>
-  <button class="btn" onclick="window.print()">🖨 Imprimir</button>
+  {# Pagina propria de impressao: window.print() aqui mandaria para o papel o
+     menu, a caixa de copiar e a tabela inteira. #}
+  <a class="btn" target="_blank" href="{{ url_for('portal.imprimir') }}">🖨 Imprimir</a>
 </div>
 
 <textarea id="codigos" class="codigos" rows="{{ [vouchers|length, 10]|min }}"

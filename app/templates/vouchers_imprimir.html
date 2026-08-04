@@ -62,6 +62,7 @@
     <div class="tit">
       <h1>Vouchers de acesso Wi-Fi</h1>
       <p class="sub">
+        {% if titular %}{{ titular }} · {% endif %}
         {{ rows|length }} voucher(s){% if parcial %} (seleção){% endif %}
         {% if todos %} · inclui usados e expirados{% endif %}
         · impresso em {{ agora|ts if agora }}
