@@ -832,9 +832,10 @@ def list_voucher_grants(conn, site_id=None, portal_user_id=None,
     if somente_disponiveis:
         # o que ainda funciona: nao revogado, nao usado e ainda no controller.
         # status NULL = nunca sincronizado, entao entra por precaucao.
-        where.append("g.revogado_em IS NULL AND g.used = 0 "
-                     "AND (g.status IS NULL OR g.status NOT IN "
-                     "('USED_UPDATED','EXPIRED','AUSENTE'))")
+        where.append(
+            "g.revogado_em IS NULL AND g.used = 0 "
+            "AND (g.status IS NULL OR g.status <> ALL(%s))")
+        args.append(list(VOUCHER_STATUS_MORTOS))
     if search:
         s = f"%{search.strip()}%"
         where.append("(g.code LIKE %s OR g.note LIKE %s OR p.nome LIKE %s "
@@ -847,55 +848,78 @@ def list_voucher_grants(conn, site_id=None, portal_user_id=None,
     return [dict(r) for r in conn.execute(q, args)]
 
 
-# Como a UniFi classifica o voucher. AUSENTE e nosso: sumiu do controller.
+# Como a UniFi classifica o voucher, mais dois status nossos (USADO, EXPIRADO),
+# deduzidos do desaparecimento -- ver sync_voucher_status.
 VOUCHER_STATUS_LABEL = {
     "VALID_ONE": "Disponível",
     "VALID_MULTI": "Disponível (multi)",
     "USED_UPDATED": "Já usado",
     "EXPIRED": "Expirado",
-    "AUSENTE": "Não está mais no controller",
+    "USADO": "Usado",
+    "EXPIRADO": "Expirado",
 }
+# Status que tiram o voucher da lista de entrega.
+VOUCHER_STATUS_MORTOS = ("USED_UPDATED", "EXPIRED", "USADO", "EXPIRADO")
 
 
 def sync_voucher_status(conn, site_id: str, vouchers: list[dict]) -> dict:
-    """Atualiza used/status a partir do que o controller devolve.
+    """Atualiza a situacao a partir do que o controller devolve.
 
-    Sem isto o sistema so sabe o que GEROU. Imprimir um lote de 100 depois que
-    37 foram usados entregaria uma folha com 37 codigos mortos.
+    Como a UniFi sinaliza o uso
+    ---------------------------
+    Ela NAO marca o voucher como usado: **remove o registro da lista**. Um
+    voucher de uso unico consumido simplesmente deixa de aparecer em
+    stat/voucher. Foi o que se observou em producao -- o codigo usado sumiu de
+    todos os sites, e o campo `used` continuou 0 em todos os que restaram.
 
-    O que sumiu do controller (a UniFi expurga os vencidos) e marcado como
-    AUSENTE em vez de apagado: o registro de quem recebeu o que precisa
-    sobreviver ao expurgo deles.
+    Entao a deteccao e o DESAPARECIMENTO, nao o campo `used`.
+
+    Sumiu por uso ou por vencimento?
+    --------------------------------
+    Dedu-se pela validade: se o voucher sumiu ANTES de vencer, foi usado; se
+    depois, expirou. Nao e informacao que a UniFi entregue, mas a distincao
+    importa para quem administra -- "usado" e consumo normal, "expirado" e
+    voucher entregue e desperdicado.
+
+    Em ambos os casos ele sai da lista de entrega: um codigo que nao existe
+    mais no controller nao funciona para ninguem.
     """
     agora = int(time.time())
     do_controller = {v.get("code"): v for v in vouchers if v.get("code")}
 
     nossos = conn.execute(
-        "SELECT id, code FROM voucher_grants "
+        "SELECT id, code, created_at, duration_min FROM voucher_grants "
         "WHERE site_id=%s AND revogado_em IS NULL", (site_id,)).fetchall()
     if not nossos:
-        return {"atualizados": 0, "ausentes": 0}
+        return {"atualizados": 0, "usados": 0, "expirados": 0}
 
-    presentes, ausentes = [], []
+    presentes, sumidos = [], []
     for r in nossos:
         v = do_controller.get(r["code"])
-        if v is None:
-            ausentes.append((agora, r["id"]))
-        else:
+        if v is not None:
             presentes.append((int(v.get("used") or 0),
                               v.get("status") or "", agora, r["id"]))
+            continue
+        vence_em = (r["created_at"] or 0) + (r["duration_min"] or 0) * 60
+        # margem de 5 min: a coleta e periodica, entao o instante exato do
+        # sumico nao e conhecido -- perto do vencimento, assume vencimento
+        usado = bool(vence_em) and agora < vence_em - 300
+        sumidos.append(("USADO" if usado else "EXPIRADO",
+                        1 if usado else 0, agora, r["id"]))
 
     with conn.cursor() as cur:
         if presentes:
             cur.executemany(
                 "UPDATE voucher_grants SET used=%s, status=%s, synced_at=%s "
                 "WHERE id=%s", presentes)
-        if ausentes:
+        if sumidos:
             cur.executemany(
-                "UPDATE voucher_grants SET status='AUSENTE', synced_at=%s "
-                "WHERE id=%s", ausentes)
+                "UPDATE voucher_grants SET status=%s, used=%s, synced_at=%s "
+                "WHERE id=%s", sumidos)
     conn.commit()
-    return {"atualizados": len(presentes), "ausentes": len(ausentes)}
+    return {"atualizados": len(presentes),
+            "usados": sum(1 for s in sumidos if s[0] == "USADO"),
+            "expirados": sum(1 for s in sumidos if s[0] == "EXPIRADO")}
 
 
 def get_voucher_grant(conn, grant_id) -> dict | None:
@@ -945,11 +969,11 @@ def voucher_stats(conn) -> dict:
                COUNT(*) FILTER (WHERE retirado_em IS NOT NULL) AS retirados,
                COUNT(*) FILTER (WHERE portal_user_id IS NOT NULL) AS atribuidos,
                COUNT(*) FILTER (WHERE used > 0) AS usados,
-               COUNT(*) FILTER (WHERE status = 'AUSENTE') AS ausentes,
+               COUNT(*) FILTER (WHERE status IN ('EXPIRADO','EXPIRED')) AS expirados,
                COUNT(*) FILTER (
                    WHERE revogado_em IS NULL AND used = 0
                      AND (status IS NULL OR status NOT IN
-                          ('USED_UPDATED','EXPIRED','AUSENTE'))
+                          ('USED_UPDATED','EXPIRED','USADO','EXPIRADO'))
                ) AS disponiveis,
                MAX(synced_at) AS ultima_sync
         FROM voucher_grants
