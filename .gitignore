@@ -44,3 +44,9 @@ _Projeto_Gerenciamento_MAC_Unifi/
 .claude/settings.local.json
 .DS_Store
 Thumbs.db
+
+# --- material local que contem endereco interno ou dado real ---
+# Os specs dos POPs trazem IP do servidor e do controller, e a pasta migracao/
+# guarda o banco de producao. O repositorio e PUBLICO.
+pops/
+migracao/
