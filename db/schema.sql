@@ -173,11 +173,19 @@ CREATE TABLE IF NOT EXISTS voucher_grants(
     created_at     BIGINT,
     retirado_em    BIGINT,                 -- quando a pessoa viu o codigo no portal
     revogado_em    BIGINT,
-    revogado_por   TEXT
+    revogado_por   TEXT,
+    -- Situacao de uso, sincronizada do controller pelo coletor (ver
+    -- db/migrations/0001_voucher_status.sql). Sem isso nao da para saber
+    -- quais codigos ainda funcionam na hora de imprimir um lote.
+    used           SMALLINT NOT NULL DEFAULT 0,  -- 0 = ainda nao usado
+    status         TEXT,                   -- VALID_ONE | USED_UPDATED | EXPIRED | AUSENTE
+    synced_at      BIGINT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_vgrants_code ON voucher_grants(site_id, code);
 CREATE INDEX IF NOT EXISTS idx_vgrants_user ON voucher_grants(portal_user_id);
 CREATE INDEX IF NOT EXISTS idx_vgrants_criado ON voucher_grants(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_vgrants_disponivel
+    ON voucher_grants(site_id, used) WHERE revogado_em IS NULL;
 
 -- ------------------------------------------------------- estado efemero
 -- Estas tres tabelas expiram sozinhas por TTL (20s a 180s). Sao migradas por

@@ -234,6 +234,33 @@ def migracoes_status(conn) -> list[dict]:
         "ORDER BY versao")]
 
 
+def prepare_database() -> dict:
+    """Deixa o banco pronto. Unico ponto que decide schema.sql x migracoes.
+
+    Banco NOVO   -> aplica o schema.sql (fotografia do estado atual) e MARCA as
+                    migracoes como aplicadas, sem executa-las: o schema ja
+                    nasceu com tudo que elas fariam.
+    Banco EXISTENTE -> NAO toca no schema.sql, so aplica as migracoes pendentes.
+
+    Por que nao rodar o schema.sql sempre: ele descreve o estado FINAL. Um
+    indice novo sobre uma coluna que so a migracao acrescenta faria o
+    `CREATE INDEX` falhar com "column ... does not exist" num banco antigo --
+    exatamente o que aconteceu ao publicar a migracao 0001.
+
+    Consequencia pratica: **tabela nova tambem precisa de migracao**, nao basta
+    acrescentar ao schema.sql.
+    """
+    with connection() as conn:
+        novo = banco_vazio(conn)
+
+    if novo:
+        apply_schema()
+
+    with connection() as conn:
+        aplicadas = apply_migrations(conn, baseline=novo)
+    return {"novo": novo, "migracoes": aplicadas}
+
+
 # ================================================================== escrita
 _UPSERT = """
 INSERT INTO mac_state
@@ -784,7 +811,8 @@ LEFT JOIN portal_users p ON p.id = g.portal_user_id
 
 
 def list_voucher_grants(conn, site_id=None, portal_user_id=None,
-                        somente_ativos=False, search=None, create_time=None,
+                        somente_ativos=False, somente_disponiveis=False,
+                        search=None, create_time=None, ids=None,
                         limit=500) -> list[dict]:
     q = _VG_SELECT
     where, args = [], []
@@ -796,8 +824,17 @@ def list_voucher_grants(conn, site_id=None, portal_user_id=None,
         # identifica um LOTE: a UniFi carimba o mesmo create_time em todos os
         # vouchers gerados na mesma operacao
         where.append("g.create_time=%s"); args.append(create_time)
+    if ids:
+        # impressao parcial: so os itens marcados na tela
+        where.append("g.id = ANY(%s)"); args.append(list(ids))
     if somente_ativos:
         where.append("g.revogado_em IS NULL")
+    if somente_disponiveis:
+        # o que ainda funciona: nao revogado, nao usado e ainda no controller.
+        # status NULL = nunca sincronizado, entao entra por precaucao.
+        where.append("g.revogado_em IS NULL AND g.used = 0 "
+                     "AND (g.status IS NULL OR g.status NOT IN "
+                     "('USED_UPDATED','EXPIRED','AUSENTE'))")
     if search:
         s = f"%{search.strip()}%"
         where.append("(g.code LIKE %s OR g.note LIKE %s OR p.nome LIKE %s "
@@ -808,6 +845,57 @@ def list_voucher_grants(conn, site_id=None, portal_user_id=None,
     q += " ORDER BY g.created_at DESC, g.id DESC LIMIT %s"
     args.append(limit)
     return [dict(r) for r in conn.execute(q, args)]
+
+
+# Como a UniFi classifica o voucher. AUSENTE e nosso: sumiu do controller.
+VOUCHER_STATUS_LABEL = {
+    "VALID_ONE": "Disponível",
+    "VALID_MULTI": "Disponível (multi)",
+    "USED_UPDATED": "Já usado",
+    "EXPIRED": "Expirado",
+    "AUSENTE": "Não está mais no controller",
+}
+
+
+def sync_voucher_status(conn, site_id: str, vouchers: list[dict]) -> dict:
+    """Atualiza used/status a partir do que o controller devolve.
+
+    Sem isto o sistema so sabe o que GEROU. Imprimir um lote de 100 depois que
+    37 foram usados entregaria uma folha com 37 codigos mortos.
+
+    O que sumiu do controller (a UniFi expurga os vencidos) e marcado como
+    AUSENTE em vez de apagado: o registro de quem recebeu o que precisa
+    sobreviver ao expurgo deles.
+    """
+    agora = int(time.time())
+    do_controller = {v.get("code"): v for v in vouchers if v.get("code")}
+
+    nossos = conn.execute(
+        "SELECT id, code FROM voucher_grants "
+        "WHERE site_id=%s AND revogado_em IS NULL", (site_id,)).fetchall()
+    if not nossos:
+        return {"atualizados": 0, "ausentes": 0}
+
+    presentes, ausentes = [], []
+    for r in nossos:
+        v = do_controller.get(r["code"])
+        if v is None:
+            ausentes.append((agora, r["id"]))
+        else:
+            presentes.append((int(v.get("used") or 0),
+                              v.get("status") or "", agora, r["id"]))
+
+    with conn.cursor() as cur:
+        if presentes:
+            cur.executemany(
+                "UPDATE voucher_grants SET used=%s, status=%s, synced_at=%s "
+                "WHERE id=%s", presentes)
+        if ausentes:
+            cur.executemany(
+                "UPDATE voucher_grants SET status='AUSENTE', synced_at=%s "
+                "WHERE id=%s", ausentes)
+    conn.commit()
+    return {"atualizados": len(presentes), "ausentes": len(ausentes)}
 
 
 def get_voucher_grant(conn, grant_id) -> dict | None:
@@ -855,7 +943,15 @@ def voucher_stats(conn) -> dict:
         SELECT COUNT(*) AS total,
                COUNT(*) FILTER (WHERE revogado_em IS NULL) AS ativos,
                COUNT(*) FILTER (WHERE retirado_em IS NOT NULL) AS retirados,
-               COUNT(*) FILTER (WHERE portal_user_id IS NOT NULL) AS atribuidos
+               COUNT(*) FILTER (WHERE portal_user_id IS NOT NULL) AS atribuidos,
+               COUNT(*) FILTER (WHERE used > 0) AS usados,
+               COUNT(*) FILTER (WHERE status = 'AUSENTE') AS ausentes,
+               COUNT(*) FILTER (
+                   WHERE revogado_em IS NULL AND used = 0
+                     AND (status IS NULL OR status NOT IN
+                          ('USED_UPDATED','EXPIRED','AUSENTE'))
+               ) AS disponiveis,
+               MAX(synced_at) AS ultima_sync
         FROM voucher_grants
     """).fetchone()
     return dict(r)

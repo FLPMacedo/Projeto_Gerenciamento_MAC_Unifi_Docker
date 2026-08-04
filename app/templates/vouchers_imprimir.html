@@ -24,8 +24,12 @@
     .multi { color:#a15c00; font-weight:700; }
     .acoes { margin:0 0 14px; }
     button { font-size:14px; padding:6px 14px; cursor:pointer; }
+    .aviso { border:1px solid #d8a200; background:#fff8e5; color:#6b4e00;
+             padding:9px 12px; border-radius:6px; font-size:13px;
+             margin:0 0 14px; }
+    .usado { color:#a15c00; font-weight:700; }
     @media print {
-      .acoes { display:none; }
+      .acoes, .aviso { display:none; }
       .v { break-inside:avoid; }
       body { margin:0; }
     }
@@ -34,7 +38,22 @@
 <body>
   <div class="acoes">
     <button onclick="window.print()">🖨 Imprimir / Salvar como PDF</button>
+    {% if not todos %}
+    <span style="font-size:12px;color:#555;margin-left:10px">
+      Só os que ainda funcionam
+      {% if ultima_sync %}· situação conferida em {{ ultima_sync|ts }}
+      {% else %}· <b style="color:#a15c00">situação nunca conferida</b>{% endif %}
+    </span>
+    {% endif %}
   </div>
+
+  {% if not ultima_sync %}
+  <div class="aviso">
+    ⚠️ A situação dos vouchers nunca foi conferida no controller, então esta
+    folha pode conter códigos já usados. Volte à tela de Vouchers e clique em
+    <b>"Conferir quais foram usados"</b> antes de imprimir para entrega.
+  </div>
+  {% endif %}
 
   <div class="topo">
     {% if brand_logo_url %}
@@ -42,7 +61,11 @@
     {% endif %}
     <div class="tit">
       <h1>Vouchers de acesso Wi-Fi</h1>
-      <p class="sub">{{ rows|length }} voucher(s) · gerado em {{ agora|ts if agora }}</p>
+      <p class="sub">
+        {{ rows|length }} voucher(s){% if parcial %} (seleção){% endif %}
+        {% if todos %} · inclui usados e expirados{% endif %}
+        · impresso em {{ agora|ts if agora }}
+      </p>
     </div>
     <img src="{{ url_for('static', filename='logo_unifi.jpg') }}" alt="UniFi">
   </div>
@@ -55,6 +78,9 @@
       <div class="meta">
         {{ r.site_desc or r.site_id }}<br>
         {% if r.note %}{{ r.note }}<br>{% endif %}
+        {% if r.used %}<span class="usado">JÁ USADO</span> ·
+        {% elif r.status == 'AUSENTE' %}<span class="usado">EXPIRADO</span> ·
+        {% endif %}
         {% if r.quota == 1 %}Uso único
         {% else %}<span class="multi">{{ quota_label(r.quota) }}</span>{% endif %}
         {% if r.duration_min %} · validade {{ (r.duration_min // 60) or r.duration_min }}

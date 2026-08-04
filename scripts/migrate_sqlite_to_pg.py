@@ -245,7 +245,7 @@ def main() -> None:
     from unifi import db  # noqa: PLC0415 -- ver nota no topo do arquivo
 
     db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "60")))
-    db.apply_schema()
+    db.prepare_database()
 
     with db.connection() as conn:
         destino = contar_pg(conn)

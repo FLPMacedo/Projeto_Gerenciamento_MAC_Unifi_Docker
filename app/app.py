@@ -123,7 +123,9 @@ def bootstrap() -> None:
     """Espera o banco, aplica o schema e resolve o segredo de sessao."""
     db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "60")))
     if os.getenv("APPLY_SCHEMA", "1").lower() in {"1", "true", "yes", "on"}:
-        db.apply_schema()
+        # No compose isto vem "0": quem prepara o banco e o servico `init`.
+        # Serve para rodar fora do stack (dev, ou um container avulso).
+        db.prepare_database()
     app.secret_key = _flask_secret()
     os.makedirs(BACKUP_DIR, exist_ok=True)
     with db.connection() as conn:
@@ -914,13 +916,16 @@ def _quota_label(q) -> str:
 def vouchers():
     site_id = request.args.get("site", "").strip()
     q = request.args.get("q", "").strip()
+    filtro = request.args.get("filtro", "disponiveis")  # disponiveis | todos
     with db.connection() as conn:
-        rows = db.list_voucher_grants(conn, site_id=site_id or None,
-                                      search=q or None, limit=500)
+        rows = db.list_voucher_grants(
+            conn, site_id=site_id or None, search=q or None,
+            somente_disponiveis=(filtro == "disponiveis"), limit=500)
         stats = db.voucher_stats(conn)
     return render_template("vouchers.html", rows=rows, stats=stats,
-                           site_id=site_id, q=q, sites=get_sites(),
-                           quota_label=_quota_label)
+                           site_id=site_id, q=q, filtro=filtro,
+                           sites=get_sites(), quota_label=_quota_label,
+                           status_label=db.VOUCHER_STATUS_LABEL)
 
 
 @app.route("/vouchers/novo", methods=["GET", "POST"])
@@ -1082,20 +1087,51 @@ def voucher_revogar(grant_id):
 @app.route("/vouchers/imprimir")
 def vouchers_imprimir():
     """Pagina otimizada para impressao. O PDF sai pelo Ctrl+P do navegador
-    ('Salvar como PDF'), o que evita trazer uma biblioteca de PDF so para
-    isso e mantem a impressao direta funcionando igual.
+    ('Salvar como PDF'), o que evita trazer uma biblioteca de PDF so para isso
+    e mantem a impressao direta funcionando igual.
 
-    Aceita `lote` (o create_time carimbado pela UniFi em todos os vouchers da
-    mesma geracao) ou `site`, para reimprimir o que ja existe.
+    Por padrao imprime SO OS DISPONIVEIS. Reimprimir um lote antigo sem esse
+    filtro entregaria uma folha em que os ja usados nao funcionam -- gerar 100
+    e reimprimir depois que 37 foram consumidos daria 37 codigos mortos.
+
+    Aceita:
+      id=N&id=M  -> impressao parcial (itens marcados na tela)
+      lote=<ts>  -> um lote inteiro (create_time carimbado pela UniFi)
+      site=<id>  -> tudo de um site
+      todos=1    -> inclui usados e expirados (para conferencia, nao entrega)
     """
+    ids = [int(i) for i in request.args.getlist("id") if i.isdigit()]
     lote = request.args.get("lote", "")
+    todos = request.args.get("todos") == "1"
     with db.connection() as conn:
         rows = db.list_voucher_grants(
             conn, site_id=request.args.get("site") or None,
             create_time=int(lote) if lote.isdigit() else None,
-            somente_ativos=True, limit=500)
+            ids=ids or None,
+            somente_ativos=todos, somente_disponiveis=not todos, limit=1000)
+        stats = db.voucher_stats(conn)
     return render_template("vouchers_imprimir.html", rows=rows,
-                           quota_label=_quota_label, agora=int(time.time()))
+                           quota_label=_quota_label, agora=int(time.time()),
+                           todos=todos, parcial=bool(ids),
+                           ultima_sync=stats["ultima_sync"],
+                           status_label=db.VOUCHER_STATUS_LABEL)
+
+
+@app.route("/vouchers/sincronizar", methods=["POST"])
+def vouchers_sincronizar():
+    """Confere agora quais vouchers ja foram usados, sem esperar o coletor."""
+    from collect import sincroniza_vouchers
+    try:
+        with _lock:
+            cli = get_client()
+            with db.connection() as conn:
+                r = sincroniza_vouchers(cli, conn)
+    except Exception as exc:                          # noqa: BLE001
+        flash(f"Falha ao sincronizar: {str(exc)[:160]}", "err")
+        return redirect(url_for("vouchers"))
+    flash(f"Situação atualizada: {r['atualizados']} voucher(s) conferido(s), "
+          f"{r['ausentes']} não está(ão) mais no controller.", "ok")
+    return redirect(request.form.get("next") or url_for("vouchers"))
 
 
 @app.route("/vouchers.csv")

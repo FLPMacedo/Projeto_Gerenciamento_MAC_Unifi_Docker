@@ -35,8 +35,11 @@ WORKDIR /app
 COPY app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# /app/db/schema.sql e onde unifi/db.py::apply_schema procura o schema.
-COPY db/schema.sql /app/db/schema.sql
+# A pasta db/ INTEIRA: schema.sql e as migracoes. Copiar so o schema.sql
+# deixaria db/migrations/ de fora da imagem, e o runner nao acharia nada para
+# aplicar -- o init registraria "nenhuma migracao pendente" e a alteracao
+# simplesmente nao aconteceria, sem erro nenhum.
+COPY db/ /app/db/
 COPY scripts/ /app/scripts/
 COPY app/ /app/
 

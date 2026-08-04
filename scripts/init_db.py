@@ -44,29 +44,23 @@ def main() -> None:
     log.info("aguardando o PostgreSQL...")
     db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "120")))
 
-    with db.connection() as conn:
-        # Precisa ser avaliado ANTES do schema.sql: depois dele o banco sempre
-        # pareceria "ja existente" e as migracoes seriam executadas num banco
-        # que ja nasceu com o schema mais novo.
-        novo = db.banco_vazio(conn)
+    r = db.prepare_database()
+    novo, aplicadas = r["novo"], r["migracoes"]
 
-    log.info("banco %s", "novo (sera criado do zero)" if novo
-             else "existente (so o que faltar)")
-    db.apply_schema()
-    log.info("schema.sql aplicado")
-
-    with db.connection() as conn:
-        aplicadas = db.apply_migrations(conn, baseline=novo)
-        if aplicadas and novo:
-            log.info("%d migracao(oes) marcada(s) como aplicada(s) sem executar "
-                     "(banco novo ja nasceu com o schema atual): %s",
-                     len(aplicadas), ", ".join(aplicadas))
-        elif aplicadas:
+    if novo:
+        log.info("banco novo: schema.sql aplicado")
+        if aplicadas:
+            log.info("%d migracao(oes) marcada(s) sem executar (o schema ja "
+                     "nasceu com elas): %s", len(aplicadas), ", ".join(aplicadas))
+    else:
+        log.info("banco existente: schema.sql NAO e reaplicado, so as migracoes")
+        if aplicadas:
             log.info("%d migracao(oes) aplicada(s): %s",
                      len(aplicadas), ", ".join(aplicadas))
         else:
             log.info("nenhuma migracao pendente")
 
+    with db.connection() as conn:
         tabelas = conn.execute("""
             SELECT table_name FROM information_schema.tables
             WHERE table_schema = 'public' ORDER BY table_name

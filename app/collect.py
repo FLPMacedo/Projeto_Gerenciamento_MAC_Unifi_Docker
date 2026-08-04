@@ -98,18 +98,46 @@ def collect_once(client: UnifiClient, respect_lease: bool = True) -> bool:
 
     rows, ts = snapshot_all(client)
     novos = 0
+    vsync = {"atualizados": 0, "ausentes": 0}
     with db.connection() as conn:
         res = db.record_snapshot(conn, rows, ts)
         try:
             novos = collect_unifi_audit(client, conn, client.get_sites())
         except Exception as exc:                     # noqa: BLE001
             log.warning("espelho do log da UniFi falhou: %s", exc)
+        try:
+            vsync = sincroniza_vouchers(client, conn)
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("sincronizacao de vouchers falhou: %s", exc)
 
     log.info("coleta #%s: %d linhas | %d removidos | %d eventos | "
-             "%d novos no log UniFi | %.1fs",
+             "%d novos no log UniFi | vouchers %d conferidos/%d ausentes | %.1fs",
              res["collection_id"], res["rows"], res["marked_removed"],
-             res["events"], novos, time.time() - t0)
+             res["events"], novos, vsync["atualizados"], vsync["ausentes"],
+             time.time() - t0)
     return True
+
+
+def sincroniza_vouchers(client: UnifiClient, conn) -> dict:
+    """Confere no controller quais vouchers ja foram usados.
+
+    So consulta os sites onde de fato geramos algo -- varrer os 14 sites a cada
+    10 minutos seria desperdicio, ja que a maioria nunca recebeu voucher nosso.
+    """
+    sites = conn.execute(
+        "SELECT DISTINCT site_id FROM voucher_grants "
+        "WHERE revogado_em IS NULL").fetchall()
+    total = {"atualizados": 0, "ausentes": 0}
+    for s in sites:
+        try:
+            vs = client.get_vouchers(s["site_id"])
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("vouchers do site %s: %s", s["site_id"], str(exc)[:100])
+            continue
+        r = db.sync_voucher_status(conn, s["site_id"], vs)
+        total["atualizados"] += r["atualizados"]
+        total["ausentes"] += r["ausentes"]
+    return total
 
 
 def main() -> None:
@@ -123,7 +151,9 @@ def main() -> None:
 
     db.wait_ready(float(os.getenv("DB_WAIT_TIMEOUT", "60")))
     if os.getenv("APPLY_SCHEMA", "1").lower() in {"1", "true", "yes", "on"}:
-        db.apply_schema()
+        # No compose isto vem "0": quem prepara o banco e o servico `init`.
+        # Serve para rodar fora do stack (dev, ou um container avulso).
+        db.prepare_database()
 
     with db.connection() as conn:
         log.info("UniFi: %s", unifi_config_mod.describe(conn))

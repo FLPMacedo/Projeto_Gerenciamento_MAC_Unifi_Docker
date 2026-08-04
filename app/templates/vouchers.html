@@ -5,16 +5,24 @@
 <div class="cards" style="margin-bottom:12px">
   <a class="btn primary" href="{{ url_for('voucher_novo') }}">➕ Gerar vouchers</a>
   <a class="btn" href="{{ url_for('portal_users') }}">👤 Usuários do portal</a>
-  <a class="btn" target="_blank"
-     href="{{ url_for('vouchers_imprimir', site=site_id) }}">🖨 Imprimir / PDF</a>
+  <form method="post" action="{{ url_for('vouchers_sincronizar') }}" style="display:inline">
+    <input type="hidden" name="next" value="{{ request.full_path }}">
+    <button class="btn" type="submit">↻ Conferir quais foram usados</button>
+  </form>
   <a class="btn" href="{{ url_for('vouchers_csv', site=site_id) }}">⬇ CSV</a>
 </div>
 
 <p class="muted">
-  {{ stats.total }} gerado(s) por aqui · {{ stats.ativos }} ativo(s) ·
-  {{ stats.atribuidos }} atribuído(s) a alguém · {{ stats.retirados }} já retirado(s).
-  Esta tela mostra o que <b>nós</b> geramos; o controller pode ter outros,
-  criados direto na UniFi.
+  {{ stats.total }} gerado(s) por aqui ·
+  <b>{{ stats.disponiveis }} disponível(is)</b> ·
+  {{ stats.usados }} já usado(s) ·
+  {{ stats.ausentes }} fora do controller ·
+  {{ stats.atribuidos }} atribuído(s).
+  {% if stats.ultima_sync %}
+    Situação conferida em {{ stats.ultima_sync|ts }}.
+  {% else %}
+    <b>Situação nunca conferida</b> — clique em "Conferir quais foram usados".
+  {% endif %}
 </p>
 
 <form method="get" class="filtros">
@@ -24,23 +32,49 @@
     <option value="{{ s.id }}" {{ 'selected' if s.id == site_id }}>{{ s.desc }}</option>
     {% endfor %}
   </select>
+  <select name="filtro" onchange="this.form.submit()">
+    <option value="disponiveis" {{ 'selected' if filtro == 'disponiveis' }}>Só os que funcionam</option>
+    <option value="todos" {{ 'selected' if filtro == 'todos' }}>Todos (inclui usados)</option>
+  </select>
   <input name="q" value="{{ q }}" placeholder="código, finalidade ou pessoa">
   <button class="btn" type="submit">Buscar</button>
 </form>
 
 {% if rows %}
+<form method="get" action="{{ url_for('vouchers_imprimir') }}" target="_blank" id="fimp">
+  <div class="cards" style="margin:10px 0">
+    <button class="btn primary" type="submit">🖨 Imprimir selecionados</button>
+    <label class="inline muted" style="font-size:13px">
+      <input type="checkbox" id="marcatodos"> marcar todos desta lista
+    </label>
+    <span class="muted" style="font-size:13px">
+      (<b id="ncheck">0</b> selecionado(s))
+    </span>
+  </div>
+
 <table>
   <thead>
     <tr>
-      <th>Código</th><th>Site</th><th>Finalidade</th><th>Tipo</th>
-      <th>Atribuído a</th><th>Gerado por</th><th>Gerado em</th>
-      <th>Retirado</th><th></th>
+      <th style="width:26px"></th>
+      <th>Código</th><th>Situação</th><th>Site</th><th>Finalidade</th>
+      <th>Tipo</th><th>Atribuído a</th><th>Gerado por</th><th>Gerado em</th><th></th>
     </tr>
   </thead>
   <tbody>
     {% for r in rows %}
-    <tr {% if r.revogado_em %}class="off"{% endif %}>
+    <tr {% if r.revogado_em or r.used %}class="off"{% endif %}>
+      <td>
+        {% if not r.revogado_em %}
+        <input type="checkbox" name="id" value="{{ r.id }}" class="selv">
+        {% endif %}
+      </td>
       <td class="mono"><b>{{ r.code|voucher }}</b></td>
+      <td>
+        {% if r.revogado_em %}<span class="muted">Revogado</span>
+        {% elif r.used %}<b style="color:#e0a800">Já usado</b>
+        {% elif r.status %}{{ status_label.get(r.status, r.status) }}
+        {% else %}<span class="muted">não conferido</span>{% endif %}
+      </td>
       <td class="muted">{{ r.site_desc or r.site_id }}</td>
       <td>{{ r.note or '—' }}</td>
       <td>
@@ -50,23 +84,58 @@
       <td>{{ r.portal_nome or r.portal_username or '—' }}</td>
       <td class="muted">{{ r.criado_por or '—' }}</td>
       <td class="muted">{{ r.created_at|ts }}</td>
-      <td class="muted">{{ r.retirado_em|ts }}</td>
       <td>
-        {% if r.revogado_em %}
-          <span class="muted">revogado por {{ r.revogado_por }}</span>
+        {% if not r.revogado_em %}
+        <button class="btn" type="submit" form="rev{{ r.id }}">Revogar</button>
         {% else %}
-        <form method="post" action="{{ url_for('voucher_revogar', grant_id=r.id) }}"
-              onsubmit="return confirm('Revogar o voucher {{ r.code }}? Isso apaga o código no controller e não tem volta.')">
-          <input type="hidden" name="confirm" value="1">
-          <button class="btn" type="submit">Revogar</button>
-        </form>
+        <span class="muted">por {{ r.revogado_por }}</span>
         {% endif %}
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</form>
+
+{# Os formularios de revogacao ficam FORA da tabela: form dentro de <tr> nao e
+   HTML valido e aninhar dentro do form de impressao quebraria os dois. #}
+{% for r in rows %}{% if not r.revogado_em %}
+<form id="rev{{ r.id }}" method="post"
+      action="{{ url_for('voucher_revogar', grant_id=r.id) }}"
+      onsubmit="return confirm('Revogar o voucher {{ r.code|voucher }}? Isso apaga o código no controller e não tem volta.')">
+  <input type="hidden" name="confirm" value="1">
+</form>
+{% endif %}{% endfor %}
+
+<script>
+(function(){
+  var todos=document.getElementById("marcatodos");
+  var conta=document.getElementById("ncheck");
+  function itens(){ return Array.prototype.slice.call(document.querySelectorAll(".selv")); }
+  function atualiza(){ conta.textContent=itens().filter(function(c){return c.checked;}).length; }
+  todos.addEventListener("change", function(){
+    itens().forEach(function(c){ c.checked=todos.checked; });
+    atualiza();
+  });
+  document.addEventListener("change", function(e){
+    if(e.target.classList.contains("selv")) atualiza();
+  });
+  document.getElementById("fimp").addEventListener("submit", function(e){
+    if(!itens().some(function(c){return c.checked;})){
+      e.preventDefault();
+      alert("Marque ao menos um voucher para imprimir.");
+    }
+  });
+})();
+</script>
 {% else %}
-<p class="muted">Nenhum voucher gerado por aqui ainda.</p>
+<p class="muted">
+  {% if filtro == 'disponiveis' %}
+  Nenhum voucher disponível com esse filtro — todos podem já ter sido usados.
+  Escolha "Todos" para ver o histórico completo.
+  {% else %}
+  Nenhum voucher gerado por aqui ainda.
+  {% endif %}
+</p>
 {% endif %}
 {% endblock %}
